@@ -37,6 +37,11 @@ impl ksni::Tray for Tray {
         self.send(AppEvent::Toggle);
     }
 
+    fn watcher_offline(&self, _reason: ksni::OfflineReason) -> bool {
+        log::info!("no tray host right now; the icon appears when one starts");
+        true
+    }
+
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
             StandardItem {
@@ -76,10 +81,12 @@ fn icon() -> Vec<ksni::Icon> {
     }
 }
 
-/// Starts the tray service. Without a StatusNotifier host (no AppIndicator
-/// extension) the app still works through the hotkey and `clipvault ui`.
+/// Starts the tray service. It registers whenever a StatusNotifier host
+/// appears: at login the AppIndicator extension may start after autostart
+/// apps, and GNOME disables it on the lock screen. Without one the app still
+/// works through the hotkey and `clipvault ui`.
 pub fn spawn(tx: Sender<AppEvent>) -> Option<ksni::blocking::Handle<impl ksni::Tray>> {
-    match (Tray { tx, icon: icon() }).spawn() {
+    match (Tray { tx, icon: icon() }).assume_sni_available(true).spawn() {
         Ok(handle) => Some(handle),
         Err(e) => {
             log::warn!("no tray icon ({e}); use the hotkey or `clipvault ui`");

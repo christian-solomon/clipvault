@@ -12,10 +12,8 @@
 //!    cleared. The recorder drops any capture matching it, however late or out
 //!    of order the capture arrives.
 //!
-//! The first version used a single 3-second, consume-once flag. A busy watcher
-//! (an image arriving in INCR chunks can take seconds) or a copy queued just
-//! before let the flag expire or fire on the wrong event, and the secret was
-//! recorded in plaintext.
+//! Neither guard depends on when or in what order captures arrive: an INCR
+//! image transfer can hold the watcher for seconds.
 
 use anyhow::{anyhow, Result};
 use hmac::{Hmac, Mac};

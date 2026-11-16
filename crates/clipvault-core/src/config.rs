@@ -8,8 +8,8 @@ use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Directory name under `$XDG_DATA_HOME`. Kept from the Tauri build so an
-/// existing history and vault are picked up in place.
+/// Directory name under `$XDG_DATA_HOME`, shared with earlier releases so
+/// existing history and vault are found in place.
 pub const APP_DIR: &str = "dev.local.clipvault";
 const DB_FILE: &str = "clipvault.db";
 

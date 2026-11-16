@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ClipVault
+Comment=Clipboard history with an encrypted secrets vault
+Exec=clipvault ui
+Icon=clipvault
+Terminal=false
+Categories=Utility;Security;
+Keywords=clipboard;history;vault;secrets;password;
+StartupWMClass=clipvault

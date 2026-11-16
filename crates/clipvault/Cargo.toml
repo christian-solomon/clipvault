@@ -24,3 +24,25 @@ log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
 zeroize = "1"
+
+# `cargo install cargo-deb && cargo deb -p clipvault`
+# Keeps the package name the Tauri build used, so it upgrades in place.
+[package.metadata.deb]
+name = "clip-vault"
+maintainer = "Christian Solomon"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Clipboard history for X11 with an encrypted secrets vault. Copies that look \
+like credentials are kept in memory only; vault secrets are copied without \
+entering any clipboard history and are cleared after a delay."""
+# Linked: xcb, xkbcommon. Loaded at runtime: Vulkan, or EGL as the fallback.
+depends = "libxcb1, libxkbcommon0, libxkbcommon-x11-0, libvulkan1 | libegl1"
+assets = [
+    ["target/release/clipvault", "usr/bin/", "755"],
+    ["../../assets/clipvault.desktop", "usr/share/applications/", "644"],
+    ["../../assets/icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/clipvault.png", "644"],
+    ["../../assets/icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/clipvault.png", "644"],
+    ["../../assets/icons/128x128@2x.png", "usr/share/icons/hicolor/256x256/apps/clipvault.png", "644"],
+    ["../../assets/icons/icon.png", "usr/share/icons/hicolor/512x512/apps/clipvault.png", "644"],
+]
