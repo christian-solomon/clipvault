@@ -1,9 +1,7 @@
 use crate::harden;
 use crate::media::{human_size, ImageClip};
-use anyhow::Result;
-use base64::Engine;
+use anyhow::{bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,7 +14,17 @@ const MAX_UNPINNED: usize = 500;
 const MAX_UNPINNED_BYTES: i64 = 256 * 1024 * 1024;
 const PREVIEW_CHARS: usize = 220;
 
-#[derive(Serialize)]
+/// Schema history, tracked in `PRAGMA user_version`:
+///
+/// - 1: history with images, and the first vault (plaintext labels, entries
+///   sealed directly with the password key). The Tauri releases shipped this
+///   but never set `user_version`, so their databases read as 0.
+/// - 2: `entries.sensitive`, and the vault tables `vault_key` and
+///   `vault_items` (wrapped data key, sealed labels, AAD per row). A first-
+///   generation vault is converted on its next unlock, since that needs the
+///   password.
+const SCHEMA_VERSION: i64 = 2;
+
 pub struct Entry {
     pub id: i64,
     pub kind: String,
@@ -29,8 +37,11 @@ pub struct Entry {
     pub use_count: i64,
     pub width: Option<i64>,
     pub height: Option<i64>,
-    /// Data URL for the list thumbnail; images only.
-    pub thumb: Option<String>,
+    /// PNG bytes for the list thumbnail; images only.
+    pub thumb: Option<Vec<u8>>,
+    /// Looks like a credential. Only rows kept on purpose, or rows recorded
+    /// before detection existed, can carry this; new ones never reach disk.
+    pub sensitive: bool,
 }
 
 /// Something worth remembering off the clipboard.
@@ -48,10 +59,50 @@ impl Clip {
     }
 }
 
-#[derive(Serialize)]
-pub struct VaultItem {
+/// An AEAD output: the nonce it was sealed under and the ciphertext with tag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sealed {
+    pub nonce: Vec<u8>,
+    pub ct: Vec<u8>,
+}
+
+/// The vault's key record: KDF inputs plus the data key wrapped by the
+/// password-derived key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VaultKeyRow {
+    pub salt: Vec<u8>,
+    pub kdf_mem_kib: u32,
+    pub kdf_passes: u32,
+    pub kdf_lanes: u32,
+    pub wrapped_dek: Sealed,
+}
+
+/// A vault row with its label still sealed.
+pub struct SealedItem {
     pub id: i64,
+    pub uid: Vec<u8>,
+    pub label: Sealed,
+    pub created_at: i64,
+}
+
+/// A row about to be written to `vault_items`.
+pub struct NewSealedItem {
+    pub uid: Vec<u8>,
+    pub label: Sealed,
+    pub secret: Sealed,
+    pub created_at: i64,
+}
+
+/// A first-generation vault, read so it can be converted.
+pub struct LegacyVault {
+    pub salt: Vec<u8>,
+    pub verifier: Sealed,
+    pub entries: Vec<LegacyEntry>,
+}
+
+pub struct LegacyEntry {
     pub label: String,
+    pub secret: Sealed,
     pub created_at: i64,
 }
 
@@ -101,6 +152,9 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Overwrite deleted content with zeros instead of leaving it in free
+        // pages, where a secret moved into the vault would otherwise survive.
+        conn.pragma_update(None, "secure_delete", "ON")?;
         let store = Store {
             conn,
             max_unpinned: MAX_UNPINNED,
@@ -115,6 +169,11 @@ impl Store {
         Ok(store)
     }
 
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> &Connection {
+        &self.conn
+    }
+
     /// Replaces the default history limits, e.g. with values from `Config`.
     pub fn set_limits(&mut self, max_unpinned: usize, max_unpinned_bytes: i64) {
         self.max_unpinned = max_unpinned;
@@ -122,6 +181,25 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
+        let version: i64 = self.conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if version > SCHEMA_VERSION {
+            bail!(
+                "this database was written by a newer ClipVault (schema {version}, \
+                 this build understands up to {SCHEMA_VERSION})"
+            );
+        }
+        if version < 1 {
+            self.migrate_v1()?;
+        }
+        if version < 2 {
+            self.migrate_v2()?;
+        }
+        Ok(())
+    }
+
+    /// Creates the original schema, or completes one written by a Tauri
+    /// release from before images.
+    fn migrate_v1(&self) -> Result<()> {
         self.conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS entries (
@@ -155,6 +233,7 @@ impl Store {
             "#,
         )?;
         self.add_image_columns()?;
+        self.conn.pragma_update(None, "user_version", 1)?;
         Ok(())
     }
 
@@ -180,6 +259,64 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    fn migrate_v2(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+            ALTER TABLE entries ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0;
+
+            CREATE TABLE vault_key (
+                id           INTEGER PRIMARY KEY CHECK (id = 1),
+                salt         BLOB    NOT NULL,
+                kdf_mem_kib  INTEGER NOT NULL,
+                kdf_passes   INTEGER NOT NULL,
+                kdf_lanes    INTEGER NOT NULL,
+                dek_nonce    BLOB    NOT NULL,
+                dek_wrapped  BLOB    NOT NULL
+            );
+            CREATE TABLE vault_items (
+                id            INTEGER PRIMARY KEY,
+                uid           BLOB    NOT NULL UNIQUE,
+                label_nonce   BLOB    NOT NULL,
+                label_ct      BLOB    NOT NULL,
+                secret_nonce  BLOB    NOT NULL,
+                secret_ct     BLOB    NOT NULL,
+                created_at    INTEGER NOT NULL
+            );
+            "#,
+        )?;
+        // A first-generation vault needs the password to convert, so its
+        // tables stay until the next unlock. Without one they are dead weight.
+        let legacy: bool =
+            tx.query_row("SELECT EXISTS (SELECT 1 FROM vault_meta)", [], |r| r.get(0))?;
+        if !legacy {
+            tx.execute_batch("DROP TABLE vault_entries; DROP TABLE vault_meta;")?;
+        }
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+
+        // Anything deleted before secure_delete was turned on still sits in
+        // free pages. Rebuilding the file is the only way to drop it.
+        self.compact()
+    }
+
+    /// Folds the WAL back into the database and truncates it, so content
+    /// removed by a delete does not linger in old WAL frames.
+    pub fn scrub(&self) -> Result<()> {
+        let busy: i64 =
+            self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy != 0 {
+            log::warn!("WAL checkpoint was blocked; deleted content may linger until the next one");
+        }
+        Ok(())
+    }
+
+    /// Rebuilds the database file without its free pages, then scrubs the WAL.
+    pub fn compact(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM")?;
+        self.scrub()
     }
 
     // ---- history -------------------------------------------------------
@@ -290,7 +427,7 @@ impl Store {
         let (sql, like) = if q.is_empty() {
             (
                 "SELECT id, kind, preview, truncated, bytes, pinned, created_at, last_used_at,
-                        use_count, width, height, thumb
+                        use_count, width, height, thumb, sensitive
                  FROM entries
                  ORDER BY pinned DESC, last_used_at DESC LIMIT ?1"
                     .to_string(),
@@ -299,7 +436,7 @@ impl Store {
         } else {
             (
                 "SELECT id, kind, preview, truncated, bytes, pinned, created_at, last_used_at,
-                        use_count, width, height, thumb
+                        use_count, width, height, thumb, sensitive
                  FROM entries
                  WHERE (content LIKE ?2 ESCAPE '\\' OR (kind = 'image' AND preview LIKE ?2 ESCAPE '\\'))
                  ORDER BY pinned DESC, last_used_at DESC LIMIT ?1"
@@ -313,7 +450,6 @@ impl Store {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let map = |r: &rusqlite::Row| -> rusqlite::Result<Entry> {
-            let thumb: Option<Vec<u8>> = r.get(11)?;
             Ok(Entry {
                 id: r.get(0)?,
                 kind: r.get(1)?,
@@ -326,12 +462,8 @@ impl Store {
                 use_count: r.get(8)?,
                 width: r.get(9)?,
                 height: r.get(10)?,
-                thumb: thumb.map(|b| {
-                    format!(
-                        "data:image/png;base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(b)
-                    )
-                }),
+                thumb: r.get(11)?,
+                sensitive: r.get::<_, i64>(12)? != 0,
             })
         };
         let rows = match like {
@@ -383,9 +515,17 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_sensitive(&self, id: i64, sensitive: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET sensitive = ?1 WHERE id = ?2",
+            params![sensitive as i64, id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete(&self, id: i64) -> Result<()> {
         self.conn.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
-        Ok(())
+        self.scrub()
     }
 
     /// Clears history. Pinned entries survive unless `include_pinned`.
@@ -395,67 +535,186 @@ impl Store {
         } else {
             self.conn.execute("DELETE FROM entries WHERE pinned = 0", [])?;
         }
-        Ok(())
+        self.scrub()
     }
 
     // ---- vault ---------------------------------------------------------
+    //
+    // The store only moves sealed bytes around; `vault.rs` owns every key.
 
-    pub fn vault_meta(&self) -> Result<Option<(Vec<u8>, Vec<u8>, Vec<u8>)>> {
+    pub fn vault_key(&self) -> Result<Option<VaultKeyRow>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT salt, verify_nonce, verify_ct FROM vault_meta WHERE id = 1",
+                "SELECT salt, kdf_mem_kib, kdf_passes, kdf_lanes, dek_nonce, dek_wrapped
+                 FROM vault_key WHERE id = 1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| {
+                    Ok(VaultKeyRow {
+                        salt: r.get(0)?,
+                        kdf_mem_kib: r.get(1)?,
+                        kdf_passes: r.get(2)?,
+                        kdf_lanes: r.get(3)?,
+                        wrapped_dek: Sealed { nonce: r.get(4)?, ct: r.get(5)? },
+                    })
+                },
             )
             .optional()?)
     }
 
-    pub fn set_vault_meta(&self, salt: &[u8], nonce: &[u8], ct: &[u8]) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO vault_meta (id, salt, verify_nonce, verify_ct)
-             VALUES (1, ?1, ?2, ?3)",
-            params![salt, nonce, ct],
-        )?;
-        Ok(())
+    /// Writes the key record. Used on creation and on a password change, which
+    /// rewraps the same data key, so no item needs re-encrypting.
+    pub fn set_vault_key(&self, key: &VaultKeyRow) -> Result<()> {
+        insert_key(&self.conn, key, "INSERT OR REPLACE")?;
+        // The old wrapping is as good as the old password; do not keep it.
+        self.scrub()
     }
 
-    pub fn vault_list(&self) -> Result<Vec<VaultItem>> {
-        let mut stmt = self
+    fn has_table(&self, name: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            params![name],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The first-generation vault, if this database still holds one.
+    pub fn legacy_vault(&self) -> Result<Option<LegacyVault>> {
+        if !self.has_table("vault_meta")? {
+            return Ok(None);
+        }
+        let meta = self
             .conn
-            .prepare("SELECT id, label, created_at FROM vault_entries ORDER BY label COLLATE NOCASE")?;
-        let rows = stmt
+            .query_row(
+                "SELECT salt, verify_nonce, verify_ct FROM vault_meta WHERE id = 1",
+                [],
+                |r| Ok((r.get::<_, Vec<u8>>(0)?, Sealed { nonce: r.get(1)?, ct: r.get(2)? })),
+            )
+            .optional()?;
+        let Some((salt, verifier)) = meta else { return Ok(None) };
+        let entries = self
+            .conn
+            .prepare("SELECT label, nonce, ciphertext, created_at FROM vault_entries ORDER BY id")?
             .query_map([], |r| {
-                Ok(VaultItem { id: r.get(0)?, label: r.get(1)?, created_at: r.get(2)? })
+                Ok(LegacyEntry {
+                    label: r.get(0)?,
+                    secret: Sealed { nonce: r.get(1)?, ct: r.get(2)? },
+                    created_at: r.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(LegacyVault { salt, verifier, entries }))
+    }
+
+    /// Swaps a first-generation vault for its converted form in one
+    /// transaction, then rebuilds the file so the plaintext labels are gone
+    /// from it rather than merely unreferenced.
+    pub fn replace_legacy_vault(&self, key: &VaultKeyRow, items: &[NewSealedItem]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        insert_key(&tx, key, "INSERT")?;
+        for item in items {
+            insert_item(&tx, item)?;
+        }
+        tx.execute_batch("DROP TABLE vault_entries; DROP TABLE vault_meta;")?;
+        tx.commit()?;
+        self.compact()
+    }
+
+    pub fn vault_count(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row("SELECT COUNT(*) FROM vault_items", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    pub fn vault_items(&self) -> Result<Vec<SealedItem>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT id, uid, label_nonce, label_ct, created_at FROM vault_items ORDER BY id",
+            )?
+            .query_map([], |r| {
+                Ok(SealedItem {
+                    id: r.get(0)?,
+                    uid: r.get(1)?,
+                    label: Sealed { nonce: r.get(2)?, ct: r.get(3)? },
+                    created_at: r.get(4)?,
+                })
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    pub fn vault_insert(&self, label: &str, nonce: &[u8], ct: &[u8]) -> Result<i64> {
-        self.conn.execute(
-            "INSERT INTO vault_entries (label, nonce, ciphertext, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![label, nonce, ct, now()],
-        )?;
-        Ok(self.conn.last_insert_rowid())
-    }
-
-    pub fn vault_get(&self, id: i64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+    /// The row's uid (its AAD) and sealed secret.
+    pub fn vault_secret(&self, id: i64) -> Result<Option<(Vec<u8>, Sealed)>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT nonce, ciphertext FROM vault_entries WHERE id = ?1",
+                "SELECT uid, secret_nonce, secret_ct FROM vault_items WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, Sealed { nonce: r.get(1)?, ct: r.get(2)? })),
             )
             .optional()?)
     }
 
-    pub fn vault_delete(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM vault_entries WHERE id = ?1", params![id])?;
-        Ok(())
+    pub fn vault_insert(&self, item: &NewSealedItem) -> Result<i64> {
+        insert_item(&self.conn, item)?;
+        Ok(self.conn.last_insert_rowid())
     }
+
+    /// Inserts the sealed copy and deletes the plaintext history row together,
+    /// so a crash cannot leave the secret in both places or in neither.
+    pub fn move_entry_into_vault(&self, entry_id: i64, item: &NewSealedItem) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        insert_item(&tx, item)?;
+        let new_id = tx.last_insert_rowid();
+        let gone = tx.execute("DELETE FROM entries WHERE id = ?1", params![entry_id])?;
+        if gone != 1 {
+            bail!("entry no longer exists");
+        }
+        tx.commit()?;
+        self.scrub()?;
+        Ok(new_id)
+    }
+
+    pub fn vault_delete(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM vault_items WHERE id = ?1", params![id])?;
+        self.scrub()
+    }
+}
+
+fn insert_key(conn: &Connection, key: &VaultKeyRow, verb: &str) -> Result<()> {
+    conn.execute(
+        &format!(
+            "{verb} INTO vault_key
+               (id, salt, kdf_mem_kib, kdf_passes, kdf_lanes, dek_nonce, dek_wrapped)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)"
+        ),
+        params![
+            key.salt,
+            key.kdf_mem_kib,
+            key.kdf_passes,
+            key.kdf_lanes,
+            key.wrapped_dek.nonce,
+            key.wrapped_dek.ct
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_item(conn: &Connection, item: &NewSealedItem) -> Result<()> {
+    conn.execute(
+        "INSERT INTO vault_items
+           (uid, label_nonce, label_ct, secret_nonce, secret_ct, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            item.uid,
+            item.label.nonce,
+            item.label.ct,
+            item.secret.nonce,
+            item.secret.ct,
+            item.created_at
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -571,7 +830,7 @@ mod tests {
         assert_eq!(row.kind, "image");
         assert_eq!((row.width, row.height), (Some(120), Some(80)));
         assert!(row.preview.contains("120x80"));
-        assert!(row.thumb.unwrap().starts_with("data:image/png;base64,"));
+        assert!(row.thumb.unwrap().starts_with(b"\x89PNG"));
         assert!(s.image_png(id).unwrap().is_some());
     }
 
@@ -640,6 +899,98 @@ mod tests {
         // And the upgraded table takes images.
         s.record(&image_clip(30, 30, 1)).unwrap();
         assert_eq!(s.list("", 10).unwrap().len(), 2);
+    }
+
+    fn user_version(s: &Store) -> i64 {
+        s.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_new_database_is_at_the_current_schema() {
+        let (s, _d) = store();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        assert!(s.has_table("vault_items").unwrap() && s.has_table("vault_key").unwrap());
+        assert!(!s.has_table("vault_meta").unwrap(), "no empty first-generation tables left");
+    }
+
+    #[test]
+    fn a_tauri_database_is_upgraded_and_keeps_its_vault_tables() {
+        let dir = tempdir::Dir::new();
+        let path = dir.path().join("tauri.db");
+        {
+            // What a Tauri release left: full v1 schema, user_version never
+            // set, and a vault that can only be converted with the password.
+            let c = rusqlite::Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE entries (
+                     id INTEGER PRIMARY KEY, content TEXT NOT NULL, hash TEXT NOT NULL UNIQUE,
+                     preview TEXT NOT NULL, truncated INTEGER NOT NULL DEFAULT 0,
+                     bytes INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0,
+                     created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL,
+                     use_count INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'text',
+                     blob BLOB, thumb BLOB, width INTEGER, height INTEGER);
+                 CREATE TABLE vault_meta (id INTEGER PRIMARY KEY CHECK (id = 1), salt BLOB NOT NULL,
+                     verify_nonce BLOB NOT NULL, verify_ct BLOB NOT NULL);
+                 CREATE TABLE vault_entries (id INTEGER PRIMARY KEY, label TEXT NOT NULL,
+                     nonce BLOB NOT NULL, ciphertext BLOB NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO vault_meta VALUES (1, x'00', x'00', x'00');
+                 INSERT INTO entries (content, hash, preview, bytes, created_at, last_used_at)
+                 VALUES ('kept', 'h1', 'kept', 4, 1, 1);",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        let rows = s.list("", 10).unwrap();
+        assert_eq!(rows[0].preview, "kept");
+        assert!(!rows[0].sensitive);
+        assert!(s.legacy_vault().unwrap().is_some(), "the vault waits for its password");
+    }
+
+    #[test]
+    fn a_database_from_a_newer_build_is_refused() {
+        let dir = tempdir::Dir::new();
+        let path = dir.path().join("future.db");
+        drop(Store::open(&path).unwrap());
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        let err = Store::open(&path).err().expect("must refuse").to_string();
+        assert!(err.contains("newer ClipVault"), "{err}");
+    }
+
+    fn disk_contains(dir: &tempdir::Dir, file: &str, needle: &str) -> bool {
+        ["", "-wal"].iter().any(|suffix| {
+            std::fs::read(dir.path().join(format!("{file}{suffix}")))
+                .map(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+                .unwrap_or(false)
+        })
+    }
+
+    #[test]
+    fn deleting_an_entry_removes_it_from_the_files() {
+        let (s, d) = store();
+        let small = "SMALL-MARKER-AKIAIOSFODNN7EXAMPLE";
+        // Large enough to spill onto overflow pages, which are freed separately.
+        let large = format!("LARGE-MARKER-{}", "q".repeat(20_000));
+        let a = s.record(&Clip::Text(small.into())).unwrap().unwrap();
+        let b = s.record(&Clip::Text(large)).unwrap().unwrap();
+        s.record(&Clip::Text("unrelated".into())).unwrap();
+        assert!(disk_contains(&d, "t.db", small), "precondition: it was written");
+
+        s.delete(a).unwrap();
+        s.delete(b).unwrap();
+        assert!(!disk_contains(&d, "t.db", small));
+        assert!(!disk_contains(&d, "t.db", "LARGE-MARKER-"));
+    }
+
+    #[test]
+    fn clearing_history_removes_it_from_the_files() {
+        let (s, d) = store();
+        s.record(&Clip::Text("CLEAR-MARKER-one".into())).unwrap();
+        s.clear(false).unwrap();
+        assert!(!disk_contains(&d, "t.db", "CLEAR-MARKER-one"));
     }
 
     #[test]
@@ -762,6 +1113,7 @@ pub mod tempdir {
     pub struct Dir(PathBuf);
 
     impl Dir {
+        #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
             let p = std::env::temp_dir().join(format!(
                 "clipvault-test-{}-{:?}",

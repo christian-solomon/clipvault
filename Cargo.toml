@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/clipvault-core", "src-tauri"]
+members = ["crates/clipvault-core"]
 
 [workspace.package]
 version = "0.1.0"

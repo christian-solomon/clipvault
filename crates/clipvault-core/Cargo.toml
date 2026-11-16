@@ -9,7 +9,6 @@ publish = false
 anyhow = "1"
 libc = "0.2"
 log = "0.4"
-serde = { version = "1", features = ["derive"] }
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 x11rb = { version = "0.13", features = ["xfixes"] }
@@ -19,5 +18,4 @@ chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 sha2 = "0.10"
-base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
