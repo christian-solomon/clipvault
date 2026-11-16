@@ -5,8 +5,9 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme, Sizable, StyledExt, Theme, ThemeMode, WindowExt,
+    h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, ThemeMode, WindowExt,
 };
+use gpui_kit_assets::IconName as AssetIcon;
 use zeroize::Zeroizing;
 
 use clipvault_core::vault::Status;
@@ -698,23 +699,75 @@ impl Palette {
                                 Badge::Kept => Some(("kept secret", theme.warning)),
                                 Badge::None => None,
                             };
+                            // Shown on the selected or hovered row; a set pin always.
+                            let action = |name: &'static str,
+                                          icon: Icon,
+                                          tip: &'static str,
+                                          shown: bool,
+                                          act: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+                                div()
+                                    .when(!shown, |d| {
+                                        d.invisible().group_hover("row", |s| s.visible())
+                                    })
+                                    .child(
+                                        Button::new((name, ix))
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(icon)
+                                            .tooltip(tip)
+                                            .on_click(cx.listener(
+                                                move |this, _: &ClickEvent, window, cx| {
+                                                    cx.stop_propagation();
+                                                    this.state.update(cx, |s, cx| s.select(ix, cx));
+                                                    act(this, window, cx);
+                                                },
+                                            )),
+                                    )
+                            };
+                            let pin_icon = if row.pinned {
+                                Icon::new(IconName::StarFill).text_color(theme.warning)
+                            } else {
+                                Icon::new(IconName::Star)
+                            };
+                            let actions = h_flex()
+                                .flex_none()
+                                .child(action(
+                                    "pin",
+                                    pin_icon,
+                                    if row.pinned { "Unpin (Ctrl+P)" } else { "Pin (Ctrl+P)" },
+                                    selected || row.pinned,
+                                    |this, window, cx| this.on_toggle_pin(&TogglePin, window, cx),
+                                ))
+                                .when(!row.image, |d| {
+                                    d.child(action(
+                                        "vault",
+                                        Icon::new(AssetIcon::Lock),
+                                        "Move into the vault (Ctrl+S)",
+                                        selected,
+                                        |this, window, cx| {
+                                            this.on_move_to_vault(&MoveToVault, window, cx)
+                                        },
+                                    ))
+                                })
+                                .child(action(
+                                    "delete",
+                                    Icon::new(AssetIcon::Trash),
+                                    "Delete (Shift+Delete)",
+                                    selected,
+                                    |this, window, cx| this.on_delete(&DeleteSelected, window, cx),
+                                ));
                             h_flex()
                                 .id(("row", ix))
+                                .group("row")
                                 .w_full()
                                 .h(px(ROW_HEIGHT))
-                                .px_3()
+                                .pl_3()
+                                .pr_1()
                                 .gap_2()
                                 .rounded(theme.radius)
                                 .cursor_pointer()
                                 .when(selected, |d| d.bg(theme.list_active))
                                 .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
-                                .child(
-                                    div()
-                                        .w(px(12.))
-                                        .text_xs()
-                                        .text_color(theme.warning)
-                                        .child(if row.pinned { "★" } else { "" }),
-                                )
                                 .when_some(row.thumb.clone(), |d, thumb| {
                                     d.child(
                                         img(thumb)
@@ -746,6 +799,7 @@ impl Palette {
                                                 .child(row.meta.clone()),
                                         ),
                                 )
+                                .child(actions)
                                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                                     this.state.update(cx, |s, cx| s.select(ix, cx));
                                     if ev.click_count() >= 2 {

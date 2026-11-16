@@ -2,6 +2,7 @@
 
 mod app;
 mod appearance;
+mod assets;
 mod hotkey;
 mod locker;
 mod tray;
@@ -172,21 +173,24 @@ fn run(args: &[String]) -> Result<()> {
         }
     };
 
-    gpui_platform::application().with_quit_mode(QuitMode::Explicit).run(move |cx: &mut App| {
-        gpui_component::init(cx);
-        ui::bind_keys(cx);
-        let state = cx.new(|cx| AppState::new(cfg, store, ephemeral, clipboard, dark, cx));
-        let st = state.clone();
-        cx.spawn(async move |cx| {
-            while let Ok(event) = rx.recv().await {
-                cx.update(|cx| app::handle_event(&st, event, cx));
+    gpui_platform::application()
+        .with_assets(assets::Assets)
+        .with_quit_mode(QuitMode::Explicit)
+        .run(move |cx: &mut App| {
+            gpui_component::init(cx);
+            ui::bind_keys(cx);
+            let state = cx.new(|cx| AppState::new(cfg, store, ephemeral, clipboard, dark, cx));
+            let st = state.clone();
+            cx.spawn(async move |cx| {
+                while let Ok(event) = rx.recv().await {
+                    cx.update(|cx| app::handle_event(&st, event, cx));
+                }
+            })
+            .detach();
+            if intent != Intent::Daemon {
+                app::show_window(&state, cx);
             }
-        })
-        .detach();
-        if intent != Intent::Daemon {
-            app::show_window(&state, cx);
-        }
-    });
+        });
     Ok(())
 }
 

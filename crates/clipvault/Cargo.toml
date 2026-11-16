@@ -13,6 +13,7 @@ clipvault-core = { path = "../clipvault-core" }
 gpui = { package = "gpui-pre", version = "=0.3.12" }
 gpui-pre-platform = { version = "=0.3.12", default-features = false, features = ["x11"] }
 gpui-component = "=0.10.0"
+gpui-kit-assets = "=0.10.0"
 
 async-channel = "2"
 ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }

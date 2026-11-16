@@ -957,6 +957,7 @@ dependencies = [
  "env_logger",
  "global-hotkey",
  "gpui-component",
+ "gpui-kit-assets",
  "gpui-pre",
  "gpui-pre-platform",
  "ksni",
