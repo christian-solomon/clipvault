@@ -29,6 +29,8 @@ pub enum AppEvent {
     Toggle,
     Lock(&'static str),
     Recorded(Recorded),
+    /// The desktop switched colour scheme; `true` is dark.
+    Appearance(bool),
     Quit,
 }
 
@@ -92,6 +94,8 @@ pub struct AppState {
     /// A KDF is running; the gate shows progress instead of accepting input.
     pub busy: bool,
     clipboard: Option<ClipboardWriter>,
+    /// The desktop's colour scheme; `None` leaves it to GPUI.
+    pub dark: Option<bool>,
 
     pub window: Option<WindowHandle<Root>>,
     pub tab: Tab,
@@ -124,6 +128,7 @@ impl AppState {
         store: Arc<Mutex<Store>>,
         ephemeral: Arc<Mutex<Ephemeral>>,
         clipboard: Option<ClipboardWriter>,
+        dark: Option<bool>,
         cx: &mut Context<Self>,
     ) -> Self {
         // One timer drives expiry, auto-lock and the visible countdowns.
@@ -140,6 +145,7 @@ impl AppState {
             vault: Arc::new(Mutex::new(Vault::default())),
             busy: false,
             clipboard,
+            dark,
             window: None,
             tab: Tab::History,
             query: String::new(),
@@ -763,7 +769,7 @@ pub fn show_window(state: &Entity<AppState>, cx: &mut App) {
         window_bounds: Some(WindowBounds::centered(size(px(820.), px(540.)), cx)),
         titlebar: Some(TitlebarOptions {
             title: Some("ClipVault".into()),
-            appears_transparent: true,
+            appears_transparent: false,
             traffic_light_position: None,
         }),
         kind: WindowKind::Normal,
@@ -772,7 +778,7 @@ pub fn show_window(state: &Entity<AppState>, cx: &mut App) {
         is_resizable: false,
         is_minimizable: false,
         app_id: Some("clipvault".into()),
-        window_decorations: Some(WindowDecorations::Client),
+        window_decorations: Some(WindowDecorations::Server),
         ..Default::default()
     };
     let st = state.clone();
@@ -829,6 +835,13 @@ pub fn handle_event(state: &Entity<AppState>, event: AppEvent, cx: &mut App) {
                 }
             }
         }),
+        AppEvent::Appearance(dark) => {
+            state.update(cx, |s, _| s.dark = Some(dark));
+            if let Some(h) = state.read(cx).window {
+                let _ =
+                    h.update(cx, |_, window, cx| crate::ui::apply_theme(Some(dark), window, cx));
+            }
+        }
         AppEvent::Quit => cx.quit(),
     }
 }

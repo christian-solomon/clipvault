@@ -4,7 +4,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::{h_flex, v_flex, ActiveTheme, Sizable, StyledExt, Theme, WindowExt};
+use gpui_component::{
+    h_flex, v_flex, ActiveTheme, Sizable, StyledExt, Theme, ThemeMode, WindowExt,
+};
 use zeroize::Zeroizing;
 
 use clipvault_core::vault::Status;
@@ -63,10 +65,13 @@ pub fn bind_keys(cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
-/// Follows the desktop's light or dark setting, with rounded window corners.
-fn apply_theme(window: &mut Window, cx: &mut App) {
-    Theme::sync_system_appearance(Some(window), cx);
-    Theme::global_mut(cx).window_radius = px(10.);
+/// Follows the desktop's light or dark setting.
+pub(crate) fn apply_theme(dark: Option<bool>, window: &mut Window, cx: &mut App) {
+    match dark {
+        Some(true) => Theme::change(ThemeMode::Dark, Some(window), cx),
+        Some(false) => Theme::change(ThemeMode::Light, Some(window), cx),
+        None => Theme::sync_system_appearance(Some(window), cx),
+    }
     window.refresh();
 }
 
@@ -177,10 +182,13 @@ impl Palette {
                     }));
                 }
             }),
-            cx.observe_window_appearance(window, |_, window, cx| apply_theme(window, cx)),
+            cx.observe_window_appearance(window, {
+                let state = state.clone();
+                move |_, window, cx| apply_theme(state.read(cx).dark, window, cx)
+            }),
         ];
 
-        apply_theme(window, cx);
+        apply_theme(state.read(cx).dark, window, cx);
         let st = state.clone();
         window.on_window_should_close(cx, move |_, cx| {
             st.update(cx, |s, _| s.on_hidden());

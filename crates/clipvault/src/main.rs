@@ -1,6 +1,7 @@
 //! ClipVault: clipboard history with an encrypted secrets vault, for X11.
 
 mod app;
+mod appearance;
 mod hotkey;
 mod locker;
 mod tray;
@@ -109,6 +110,9 @@ fn run(args: &[String]) -> Result<()> {
         ipc::Instance::Primary(p) => p,
     };
 
+    // The portal answers method calls only while the process is dumpable.
+    let dark = appearance::current();
+
     // Before the vault or any clipboard content can exist in this process.
     if cfg!(debug_assertions) || cfg.allow_debugger {
         log::warn!("process is dumpable (debug build or CLIPVAULT_ALLOW_DEBUGGER=1)");
@@ -158,6 +162,7 @@ fn run(args: &[String]) -> Result<()> {
         }
     };
     locker::spawn(tx.clone());
+    appearance::spawn(tx.clone());
 
     let clipboard = match ClipboardWriter::new(guard) {
         Ok(c) => Some(c),
@@ -170,7 +175,7 @@ fn run(args: &[String]) -> Result<()> {
     gpui_platform::application().with_quit_mode(QuitMode::Explicit).run(move |cx: &mut App| {
         gpui_component::init(cx);
         ui::bind_keys(cx);
-        let state = cx.new(|cx| AppState::new(cfg, store, ephemeral, clipboard, cx));
+        let state = cx.new(|cx| AppState::new(cfg, store, ephemeral, clipboard, dark, cx));
         let st = state.clone();
         cx.spawn(async move |cx| {
             while let Ok(event) = rx.recv().await {
