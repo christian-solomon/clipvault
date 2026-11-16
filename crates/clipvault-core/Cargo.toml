@@ -12,10 +12,12 @@ log = "0.4"
 
 rusqlite = { version = "0.32", features = ["bundled"] }
 x11rb = { version = "0.13", features = ["xfixes"] }
+arboard = "3.7"
 
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }

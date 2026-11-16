@@ -9,7 +9,6 @@
 use anyhow::{anyhow, bail, Result};
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
@@ -21,8 +20,6 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
-
-use crate::store::hash_of;
 
 const FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 /// A whole INCR transfer gets longer than a single round trip; a full-screen
@@ -46,53 +43,6 @@ fn units_for(max_bytes: usize) -> u32 {
 pub enum Captured {
     Text(String),
     Image(Vec<u8>),
-}
-
-/// Lets the app suppress capture of clipboard writes it made itself, so that
-/// pasting from history does not create a duplicate entry and a secret copied
-/// out of the vault never reaches the plaintext history table.
-#[derive(Default)]
-pub struct Suppressor {
-    inner: Mutex<Option<(Option<String>, Instant)>>,
-}
-
-impl Suppressor {
-    /// Skip the next capture only if its content matches `text`.
-    pub fn expect(&self, text: &str) {
-        self.expect_hash(&hash_of(text));
-    }
-
-    /// Skip the next capture only if it hashes to `hash`.
-    pub fn expect_hash(&self, hash: &str) {
-        *self.inner.lock().unwrap() =
-            Some((Some(hash.to_string()), Instant::now() + Duration::from_secs(3)));
-    }
-
-    /// Skip the next capture whatever it contains. Used for vault secrets.
-    pub fn expect_any(&self) {
-        *self.inner.lock().unwrap() = Some((None, Instant::now() + Duration::from_secs(3)));
-    }
-
-    pub fn should_skip(&self, hash: &str) -> bool {
-        let mut guard = self.inner.lock().unwrap();
-        // The deadline keeps a suppression that never fired from swallowing an
-        // unrelated copy later on.
-        match guard.as_ref() {
-            Some((_, deadline)) if Instant::now() > *deadline => {
-                *guard = None;
-                false
-            }
-            Some((Some(expected), _)) if expected == hash => {
-                *guard = None;
-                true
-            }
-            Some((None, _)) => {
-                *guard = None;
-                true
-            }
-            _ => false,
-        }
-    }
 }
 
 struct Atoms {
@@ -478,37 +428,5 @@ mod tests {
         assert_eq!(units_for(8), 3);
         assert_eq!(units_for(MAX_TEXT_BYTES), (MAX_TEXT_BYTES / 4 + 1) as u32);
         assert_eq!(units_for(usize::MAX), u32::MAX);
-    }
-
-    #[test]
-    fn suppresses_only_the_matching_text() {
-        let s = Suppressor::default();
-        s.expect("ours");
-        assert!(!s.should_skip(&hash_of("someone else's")));
-        s.expect("ours");
-        assert!(s.should_skip(&hash_of("ours")));
-    }
-
-    #[test]
-    fn suppression_is_consumed_once() {
-        let s = Suppressor::default();
-        s.expect("ours");
-        assert!(s.should_skip(&hash_of("ours")));
-        assert!(!s.should_skip(&hash_of("ours")), "must not swallow a real re-copy");
-    }
-
-    #[test]
-    fn blanket_suppression_skips_any_content() {
-        let s = Suppressor::default();
-        s.expect_any();
-        assert!(s.should_skip(&hash_of("a vault secret nobody predicted")));
-    }
-
-    #[test]
-    fn stale_suppression_does_not_eat_a_later_copy() {
-        let s = Suppressor::default();
-        *s.inner.lock().unwrap() =
-            Some((None, Instant::now() - Duration::from_secs(1)));
-        assert!(!s.should_skip(&hash_of("unrelated copy")));
     }
 }
