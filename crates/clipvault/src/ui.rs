@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use clipvault_core::vault::Status;
 
 use crate::app::{AppState, Badge, Preview, RowId, Tab};
-use crate::pointer;
+use crate::x11;
 
 actions!(
     clipvault,
@@ -177,7 +177,7 @@ impl Palette {
                 } else if this.was_active {
                     this.pending_hide = Some(cx.spawn_in(window, async move |this, cx| {
                         cx.background_executor().timer(BLUR_GRACE).await;
-                        while pointer::button_held() {
+                        while x11::button_held() {
                             cx.background_executor().timer(BLUR_GRACE / 3).await;
                         }
                         let _ = this.update_in(cx, |this, window, cx| {
@@ -196,8 +196,9 @@ impl Palette {
 
         apply_theme(state.read(cx).dark, window, cx);
         let st = state.clone();
-        window.on_window_should_close(cx, move |_, cx| {
-            st.update(cx, |s, _| s.on_hidden());
+        window.on_window_should_close(cx, move |window, cx| {
+            let origin = x11::origin(window);
+            st.update(cx, |s, _| s.on_hidden(origin));
             true
         });
         search.update(cx, |s, cx| s.focus(window, cx));
@@ -221,7 +222,8 @@ impl Palette {
     fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         log::debug!("hiding the window");
         self.clear_passwords(window, cx);
-        self.state.update(cx, |s, _| s.on_hidden());
+        let origin = x11::origin(window);
+        self.state.update(cx, |s, _| s.on_hidden(origin));
         window.remove_window();
     }
 

@@ -5,9 +5,9 @@ mod appearance;
 mod assets;
 mod hotkey;
 mod locker;
-mod pointer;
 mod tray;
 mod ui;
+mod x11;
 
 use std::sync::{mpsc, Arc, Mutex};
 

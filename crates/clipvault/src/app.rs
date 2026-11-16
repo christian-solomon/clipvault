@@ -98,6 +98,8 @@ pub struct AppState {
     pub dark: Option<bool>,
 
     pub window: Option<WindowHandle<Root>>,
+    /// Where the window last was, so it reopens there. Kept for this run only.
+    last_origin: Option<Point<Pixels>>,
     pub tab: Tab,
     query: String,
     pub rows: Vec<Row>,
@@ -147,6 +149,7 @@ impl AppState {
             clipboard,
             dark,
             window: None,
+            last_origin: None,
             tab: Tab::History,
             query: String::new(),
             rows: Vec::new(),
@@ -729,8 +732,11 @@ impl AppState {
     // ---- window -------------------------------------------------------------
 
     /// Forgets anything that should not outlive the window being on screen.
-    pub fn on_hidden(&mut self) {
+    pub fn on_hidden(&mut self, origin: Option<Point<Pixels>>) {
         self.window = None;
+        if origin.is_some() {
+            self.last_origin = origin;
+        }
         self.revealed = None;
         self.reveal_task = None;
         self.show_sensitive = false;
@@ -765,6 +771,9 @@ pub fn show_window(state: &Entity<AppState>, cx: &mut App) {
         s.refresh(cx);
     });
 
+    // A display unplugged since then could leave the old spot off-screen.
+    let origin =
+        state.read(cx).last_origin.filter(|o| cx.displays().iter().any(|d| d.bounds().contains(o)));
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::centered(size(px(820.), px(540.)), cx)),
         titlebar: Some(TitlebarOptions {
@@ -786,20 +795,23 @@ pub fn show_window(state: &Entity<AppState>, cx: &mut App) {
         let view = cx.new(|cx| Palette::new(st.clone(), window, cx));
         cx.new(|cx| Root::new(view, window, cx))
     }) {
-        Ok(h) => state.update(cx, |s, _| s.window = Some(h)),
+        Ok(h) => {
+            // The window is already mapped, so this reaches the window manager
+            // after it has placed the window.
+            if let Some(origin) = origin {
+                let _ = h.update(cx, |_, window, _| crate::x11::move_to(window, origin));
+            }
+            state.update(cx, |s, _| s.window = Some(h));
+        }
         Err(e) => log::error!("could not open the window: {e:#}"),
     }
 }
 
 pub fn hide_window(state: &Entity<AppState>, cx: &mut App) {
-    let handle = state.update(cx, |s, _| {
-        let h = s.window;
-        s.on_hidden();
-        h
-    });
-    if let Some(h) = handle {
-        let _ = h.update(cx, |_, window, _| window.remove_window());
-    }
+    let Some(h) = state.read(cx).window else { return };
+    let Ok(origin) = h.update(cx, |_, window, _| crate::x11::origin(window)) else { return };
+    state.update(cx, |s, _| s.on_hidden(origin));
+    let _ = h.update(cx, |_, window, _| window.remove_window());
 }
 
 pub fn toggle_window(state: &Entity<AppState>, cx: &mut App) {
