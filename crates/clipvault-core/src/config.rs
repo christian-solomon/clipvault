@@ -99,10 +99,9 @@ fn parse<T: std::str::FromStr>(
 ) -> Result<T> {
     match set(key) {
         None => Ok(default),
-        Some(v) => v
-            .trim()
-            .parse()
-            .map_err(|_| anyhow!("{key}={v:?} is not a valid non-negative number")),
+        Some(v) => {
+            v.trim().parse().map_err(|_| anyhow!("{key}={v:?} is not a valid non-negative number"))
+        }
     }
 }
 
@@ -121,7 +120,10 @@ mod tests {
     fn defaults_match_the_original_constants() {
         let c = cfg(&[("HOME", "/home/u")]).unwrap();
         assert_eq!(c.data_dir, PathBuf::from("/home/u/.local/share/dev.local.clipvault"));
-        assert_eq!(c.db_path(), PathBuf::from("/home/u/.local/share/dev.local.clipvault/clipvault.db"));
+        assert_eq!(
+            c.db_path(),
+            PathBuf::from("/home/u/.local/share/dev.local.clipvault/clipvault.db")
+        );
         assert_eq!(c.history_max_entries, 500);
         assert_eq!(c.history_max_bytes, 256 * 1024 * 1024);
         assert_eq!(c.autolock, Duration::from_secs(600));

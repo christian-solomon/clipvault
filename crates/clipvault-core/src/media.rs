@@ -89,9 +89,8 @@ mod tests {
     use super::*;
 
     fn png_fixture(w: u32, h: u32, shade: u8) -> Vec<u8> {
-        let img = image::RgbaImage::from_fn(w, h, |x, _| {
-            image::Rgba([shade, (x % 256) as u8, 128, 255])
-        });
+        let img =
+            image::RgbaImage::from_fn(w, h, |x, _| image::Rgba([shade, (x % 256) as u8, 128, 255]));
         let mut out = Vec::new();
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)

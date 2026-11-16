@@ -63,7 +63,10 @@ const PATTERNS: &[(Kind, &str)] = &[
     (Kind::AnthropicKey, r"\bsk-ant-[A-Za-z0-9_\-]{20,}"),
     (Kind::OpenAiKey, r"\bsk-(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{20,}"),
     (Kind::Jwt, r"\beyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
-    (Kind::ConnectionString, r"(?i)\b(?:AccountKey|SharedAccessKey|SharedAccessSignature)=[A-Za-z0-9+/=%]{20,}"),
+    (
+        Kind::ConnectionString,
+        r"(?i)\b(?:AccountKey|SharedAccessKey|SharedAccessSignature)=[A-Za-z0-9+/=%]{20,}",
+    ),
     // scheme://user:password@host, with a non-empty password.
     (Kind::UrlCredentials, r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:/@]+:[^\s/@]+@[^\s/]+"),
 ];
@@ -144,17 +147,28 @@ mod tests {
             (j(&["github_pat_", &"A1b2_".repeat(10)]), Kind::GitHubToken),
             (j(&["glpat-", "xxxxxxxxxxxxxxxxxxxx"]), Kind::GitLabToken),
             (j(&["xoxb-", "123456789012-abcdefghij"]), Kind::SlackToken),
-            (j(&["https://hooks.slack.com/services/", "T0001/B0002/abcdef123"]), Kind::SlackWebhook),
+            (
+                j(&["https://hooks.slack.com/services/", "T0001/B0002/abcdef123"]),
+                Kind::SlackWebhook,
+            ),
             (j(&["sk_live_", "4eC39HqLyjWDarjtT1zdp7dc"]), Kind::StripeKey),
             (j(&["AIza", "SyA-1234567890abcdefghijklmnopqrstu"]), Kind::GoogleApiKey),
             (j(&["sk-ant-", "api03-abcdefghijklmnopqrstuvwxyz"]), Kind::AnthropicKey),
             (j(&["sk-proj-", "abcdefghijklmnopqrstuvwxyz012345"]), Kind::OpenAiKey),
             (
-                j(&["eyJhbGciOiJIUzI1NiJ9", ".eyJzdWIiOiIxMjM0NTY3ODkwIn0", ".dozjgNryP4J3jVmNHl0w5N"]),
+                j(&[
+                    "eyJhbGciOiJIUzI1NiJ9",
+                    ".eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+                    ".dozjgNryP4J3jVmNHl0w5N",
+                ]),
                 Kind::Jwt,
             ),
             (
-                j(&["DefaultEndpointsProtocol=https;AccountName=x;", "AccountKey=", &"Ab3+".repeat(10)]),
+                j(&[
+                    "DefaultEndpointsProtocol=https;AccountName=x;",
+                    "AccountKey=",
+                    &"Ab3+".repeat(10),
+                ]),
                 Kind::ConnectionString,
             ),
             (j(&["postgres://app:", "s3cr3t@db.internal:5432/app"]), Kind::UrlCredentials),

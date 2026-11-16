@@ -143,10 +143,7 @@ pub struct Store {
 }
 
 pub fn now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 pub fn hash_of(text: &str) -> String {
@@ -185,11 +182,8 @@ impl Store {
         // Overwrite deleted content with zeros instead of leaving it in free
         // pages, where a secret moved into the vault would otherwise survive.
         conn.pragma_update(None, "secure_delete", "ON")?;
-        let store = Store {
-            conn,
-            max_unpinned: MAX_UNPINNED,
-            max_unpinned_bytes: MAX_UNPINNED_BYTES,
-        };
+        let store =
+            Store { conn, max_unpinned: MAX_UNPINNED, max_unpinned_bytes: MAX_UNPINNED_BYTES };
         store.migrate()?;
         for suffix in ["", "-wal", "-shm"] {
             let mut p = path.as_os_str().to_owned();
@@ -287,8 +281,7 @@ impl Store {
             ("height", "INTEGER"),
         ] {
             if !existing.iter().any(|c| c == name) {
-                self.conn
-                    .execute(&format!("ALTER TABLE entries ADD COLUMN {name} {decl}"), [])?;
+                self.conn.execute(&format!("ALTER TABLE entries ADD COLUMN {name} {decl}"), [])?;
             }
         }
         Ok(())
@@ -357,7 +350,10 @@ impl Store {
         tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
         if !hits.is_empty() {
-            log::info!("{} history entries look like credentials and are flagged for review", hits.len());
+            log::info!(
+                "{} history entries look like credentials and are flagged for review",
+                hits.len()
+            );
         }
         Ok(())
     }
@@ -365,8 +361,7 @@ impl Store {
     /// Folds the WAL back into the database and truncates it, so content
     /// removed by a delete does not linger in old WAL frames.
     pub fn scrub(&self) -> Result<()> {
-        let busy: i64 =
-            self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        let busy: i64 = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
         if busy != 0 {
             log::warn!("WAL checkpoint was blocked; deleted content may linger until the next one");
         }
@@ -417,12 +412,8 @@ impl Store {
                 )?;
             }
             Clip::Image(img) => {
-                let preview = format!(
-                    "Image {}x{} - {}",
-                    img.width,
-                    img.height,
-                    human_size(img.png.len())
-                );
+                let preview =
+                    format!("Image {}x{} - {}", img.width, img.height, human_size(img.png.len()));
                 self.conn.execute(
                     "INSERT INTO entries
                        (kind, content, hash, preview, truncated, bytes, created_at, last_used_at,
@@ -568,15 +559,14 @@ impl Store {
     }
 
     pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE entries SET pinned = ?1 WHERE id = ?2",
-            params![pinned as i64, id],
-        )?;
+        self.conn
+            .execute("UPDATE entries SET pinned = ?1 WHERE id = ?2", params![pinned as i64, id])?;
         Ok(())
     }
 
     pub fn set_sensitivity(&self, id: i64, s: Sensitivity) -> Result<()> {
-        self.conn.execute("UPDATE entries SET sensitive = ?1 WHERE id = ?2", params![s.to_db(), id])?;
+        self.conn
+            .execute("UPDATE entries SET sensitive = ?1 WHERE id = ?2", params![s.to_db(), id])?;
         Ok(())
     }
 
@@ -594,7 +584,8 @@ impl Store {
     /// Rows the upgrade scan flagged and nobody has reviewed.
     pub fn flagged_count(&self) -> Result<usize> {
         let n: i64 =
-            self.conn.query_row("SELECT COUNT(*) FROM entries WHERE sensitive = 1", [], |r| r.get(0))?;
+            self.conn
+                .query_row("SELECT COUNT(*) FROM entries WHERE sensitive = 1", [], |r| r.get(0))?;
         Ok(n as usize)
     }
 
@@ -672,7 +663,9 @@ impl Store {
                 |r| Ok((r.get::<_, Vec<u8>>(0)?, Sealed { nonce: r.get(1)?, ct: r.get(2)? })),
             )
             .optional()?;
-        let Some((salt, verifier)) = meta else { return Ok(None) };
+        let Some((salt, verifier)) = meta else {
+            return Ok(None);
+        };
         let entries = self
             .conn
             .prepare("SELECT label, nonce, ciphertext, created_at FROM vault_entries ORDER BY id")?
@@ -892,9 +885,8 @@ mod tests {
 
     fn image_clip(w: u32, h: u32, shade: u8) -> Clip {
         use std::io::Cursor;
-        let img = image::RgbaImage::from_fn(w, h, |x, _| {
-            image::Rgba([shade, (x % 256) as u8, 64, 255])
-        });
+        let img =
+            image::RgbaImage::from_fn(w, h, |x, _| image::Rgba([shade, (x % 256) as u8, 64, 255]));
         let mut png = Vec::new();
         image::DynamicImage::ImageRgba8(img)
             .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)

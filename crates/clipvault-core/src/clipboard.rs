@@ -66,7 +66,8 @@ impl EchoGuard {
 
     /// Skip the next capture if it hashes to `hash`.
     pub fn expect_history(&self, hash: &str) {
-        *self.history.lock().unwrap() = Some((hash.to_string(), Instant::now() + HISTORY_ECHO_WINDOW));
+        *self.history.lock().unwrap() =
+            Some((hash.to_string(), Instant::now() + HISTORY_ECHO_WINDOW));
     }
 
     /// Drop every capture of `secret` until `until`, or for the rest of the
@@ -167,17 +168,15 @@ impl ClipboardWriter {
 
         #[cfg(target_os = "linux")]
         use arboard::SetExtLinux;
-        self.board
-            .set()
-            .exclude_from_history()
-            .text(secret)
-            .map_err(|e| anyhow!("clipboard: {e}"))
+        self.board.set().exclude_from_history().text(secret).map_err(|e| anyhow!("clipboard: {e}"))
     }
 
     /// Clears the clipboard if it still holds the last secret we copied.
     /// Returns whether it cleared. Anything the user copied since is left be.
     pub fn clear_secret_if_unchanged(&mut self) -> Result<bool> {
-        let Some(tag) = self.last_secret else { return Ok(false) };
+        let Some(tag) = self.last_secret else {
+            return Ok(false);
+        };
         let current = match self.board.get_text() {
             Ok(t) => Zeroizing::new(t),
             // An image or nothing at all: not ours any more.

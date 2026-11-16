@@ -61,7 +61,9 @@ impl KdfParams {
             && (1..=16).contains(&self.passes)
             && (1..=16).contains(&self.lanes);
         if !ok {
-            bail!("vault key parameters are out of range; the database may have been tampered with");
+            bail!(
+                "vault key parameters are out of range; the database may have been tampered with"
+            );
         }
         Ok(self)
     }
@@ -393,7 +395,9 @@ fn wrap(dek: &[u8; 32], password: &str, params: KdfParams) -> Result<VaultKeyRow
 /// `Ok(None)` is a wrong password; `Err` is anything else.
 fn unwrap(key: &VaultKeyRow, password: &str) -> Result<Option<Zeroizing<[u8; 32]>>> {
     let kek = kdf(password, &key.salt, KdfParams::of(key).checked()?)?;
-    let Some(plain) = open(&kek, &key.wrapped_dek, AAD_DEK) else { return Ok(None) };
+    let Some(plain) = open(&kek, &key.wrapped_dek, AAD_DEK) else {
+        return Ok(None);
+    };
     let bytes: [u8; 32] =
         plain.as_slice().try_into().map_err(|_| anyhow!("stored vault key is malformed"))?;
     Ok(Some(Zeroizing::new(bytes)))
@@ -718,10 +722,10 @@ mod tests {
         v.unlock(&s, PW).unwrap();
         assert!(s.legacy_vault().unwrap().is_none(), "legacy tables are gone");
         let items = v.items(&s).unwrap();
-        assert_eq!(items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), [
-            "api",
-            "LEGACY-LABEL-prod-db"
-        ]);
+        assert_eq!(
+            items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(),
+            ["api", "LEGACY-LABEL-prod-db"]
+        );
         let db = items.iter().find(|i| i.label.starts_with("LEGACY")).unwrap();
         assert_eq!(&*v.reveal(&s, db.id).unwrap(), "pg-password-1");
         assert_eq!(items[0].created_at, 7, "creation time carries over");

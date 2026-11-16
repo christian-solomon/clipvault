@@ -69,8 +69,8 @@ fn intern(conn: &RustConnection, name: &str) -> Result<Atom> {
 
 impl Watcher {
     fn new() -> Result<Self> {
-        let (conn, screen_num) = x11rb::connect(None)
-            .map_err(|e| anyhow!("cannot connect to the X server: {e}"))?;
+        let (conn, screen_num) =
+            x11rb::connect(None).map_err(|e| anyhow!("cannot connect to the X server: {e}"))?;
         let root = conn.setup().roots[screen_num].root;
 
         // XFixes requires a version handshake before any of its requests work.
@@ -308,10 +308,7 @@ impl Watcher {
             Some(v) => v,
             None => return Ok(vec![]),
         };
-        Ok(raw
-            .chunks_exact(4)
-            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
+        Ok(raw.chunks_exact(4).map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]])).collect())
     }
 
     /// Returns whatever is worth keeping, or None when the clipboard holds
@@ -373,7 +370,9 @@ impl Watcher {
     fn run(&mut self, tx: Sender<Captured>) -> Result<()> {
         loop {
             let event = self.next_event()?;
-            let Event::XfixesSelectionNotify(e) = event else { continue };
+            let Event::XfixesSelectionNotify(e) = event else {
+                continue;
+            };
             // owner == NONE is the previous owner going away, not a new copy.
             if e.owner == self.win || e.owner == x11rb::NONE {
                 continue;
