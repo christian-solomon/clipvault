@@ -5,6 +5,7 @@ mod appearance;
 mod assets;
 mod hotkey;
 mod locker;
+mod pointer;
 mod tray;
 mod ui;
 

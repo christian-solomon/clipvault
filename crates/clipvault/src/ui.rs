@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 use clipvault_core::vault::Status;
 
 use crate::app::{AppState, Badge, Preview, RowId, Tab};
+use crate::pointer;
 
 actions!(
     clipvault,
@@ -167,7 +168,8 @@ impl Palette {
             // A palette gets out of the way once you click elsewhere. Focus also
             // blinks away for a moment whenever the window manager's own key
             // grabs fire (GNOME's locate-pointer grabs Ctrl), so only a loss
-            // that lasts counts.
+            // that lasts counts, and none while a button is held: a title-bar
+            // drag holds focus until it ends.
             cx.observe_window_activation(window, |this, window, cx| {
                 if window.is_window_active() {
                     this.was_active = true;
@@ -175,6 +177,9 @@ impl Palette {
                 } else if this.was_active {
                     this.pending_hide = Some(cx.spawn_in(window, async move |this, cx| {
                         cx.background_executor().timer(BLUR_GRACE).await;
+                        while pointer::button_held() {
+                            cx.background_executor().timer(BLUR_GRACE / 3).await;
+                        }
                         let _ = this.update_in(cx, |this, window, cx| {
                             if !window.is_window_active() && !window.has_active_dialog(cx) {
                                 this.hide(window, cx);
