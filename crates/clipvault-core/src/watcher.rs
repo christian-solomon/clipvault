@@ -32,6 +32,15 @@ const INCR_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_TEXT_BYTES: usize = 2 * 1024 * 1024;
 /// Generous enough for a 4K screenshot.
 const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+/// TARGETS lists and the password-manager hint are a few dozen bytes; anything
+/// near this size is an owner misbehaving.
+const MAX_META_BYTES: usize = 64 * 1024;
+
+/// `GetProperty` counts in 32-bit units. Asking for one unit more than the cap
+/// lets `bytes_after` reveal an oversized value without transferring all of it.
+fn units_for(max_bytes: usize) -> u32 {
+    u32::try_from(max_bytes / 4 + 1).unwrap_or(u32::MAX)
+}
 
 /// What came off the clipboard, still undecoded.
 pub enum Captured {
@@ -222,8 +231,9 @@ impl Watcher {
         }
     }
 
-    /// Asks the current owner for the selection in `target`.
-    fn fetch(&mut self, target: Atom) -> Result<Option<Vec<u8>>> {
+    /// Asks the current owner for the selection in `target`, giving up on
+    /// anything larger than `max_bytes` rather than buffering it first.
+    fn fetch(&mut self, target: Atom, max_bytes: usize) -> Result<Option<Vec<u8>>> {
         let time = self.server_time()?;
         for attempt in 0..2 {
             self.conn.delete_property(self.win, self.atoms.prop)?;
@@ -257,17 +267,28 @@ impl Watcher {
             // the signal that we are ready for the first chunk.
             let reply = self
                 .conn
-                .get_property(false, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0x1FFF_FFFF)?
+                .get_property(
+                    false,
+                    self.win,
+                    self.atoms.prop,
+                    AtomEnum::ANY,
+                    0,
+                    units_for(max_bytes),
+                )?
                 .reply()?;
 
             if reply.type_ == self.atoms.incr {
                 self.conn.delete_property(self.win, self.atoms.prop)?;
                 self.conn.flush()?;
-                return self.read_incr();
+                return self.read_incr(max_bytes);
             }
 
             self.conn.delete_property(self.win, self.atoms.prop)?;
             self.conn.flush()?;
+            if reply.bytes_after > 0 || reply.value.len() > max_bytes {
+                log::debug!("skipping oversized value for target {target}");
+                return Ok(None);
+            }
             return Ok(Some(reply.value));
         }
         Ok(None)
@@ -277,7 +298,7 @@ impl Watcher {
     /// waits for us to delete the property before writing the next; a
     /// zero-length chunk ends it. Large images always arrive this way, because
     /// they do not fit in a single property.
-    fn read_incr(&mut self) -> Result<Option<Vec<u8>>> {
+    fn read_incr(&mut self, max_bytes: usize) -> Result<Option<Vec<u8>>> {
         let deadline = Instant::now() + INCR_TIMEOUT;
         let mut out: Vec<u8> = Vec::new();
 
@@ -288,7 +309,14 @@ impl Watcher {
             }
             let chunk = self
                 .conn
-                .get_property(true, self.win, self.atoms.prop, AtomEnum::ANY, 0, 0x1FFF_FFFF)?
+                .get_property(
+                    true,
+                    self.win,
+                    self.atoms.prop,
+                    AtomEnum::ANY,
+                    0,
+                    units_for(max_bytes),
+                )?
                 .reply()?;
             // Deleting the property is what tells the owner to send the next one.
             self.conn.flush()?;
@@ -298,7 +326,7 @@ impl Watcher {
                 return Ok(Some(out));
             }
             out.extend_from_slice(&chunk.value);
-            if out.len() > MAX_IMAGE_BYTES {
+            if chunk.bytes_after > 0 || out.len() > max_bytes {
                 log::debug!("abandoning oversized incremental transfer");
                 return Ok(None);
             }
@@ -326,7 +354,7 @@ impl Watcher {
     }
 
     fn targets(&mut self) -> Result<Vec<Atom>> {
-        let raw = match self.fetch(self.atoms.targets)? {
+        let raw = match self.fetch(self.atoms.targets, MAX_META_BYTES)? {
             Some(v) => v,
             None => return Ok(vec![]),
         };
@@ -348,7 +376,7 @@ impl Watcher {
         // Password managers tag their copies so that history tools leave them
         // alone. Honour that - those belong in the vault, by hand, not here.
         if targets.contains(&self.atoms.password_hint) {
-            if let Some(v) = self.fetch(self.atoms.password_hint)? {
+            if let Some(v) = self.fetch(self.atoms.password_hint, MAX_META_BYTES)? {
                 if v.eq_ignore_ascii_case(b"secret") {
                     log::info!("skipped a copy flagged as a password manager secret");
                     return Ok(None);
@@ -361,7 +389,7 @@ impl Watcher {
         // text is what you actually wanted.
         if let Some(target) = self.atoms.text_targets.iter().copied().find(|t| targets.contains(t))
         {
-            let Some(bytes) = self.fetch(target)? else {
+            let Some(bytes) = self.fetch(target, MAX_TEXT_BYTES)? else {
                 return Ok(None);
             };
             if bytes.len() > MAX_TEXT_BYTES {
@@ -379,7 +407,7 @@ impl Watcher {
 
         if let Some(target) = self.atoms.image_targets.iter().copied().find(|t| targets.contains(t))
         {
-            let Some(bytes) = self.fetch(target)? else {
+            let Some(bytes) = self.fetch(target, MAX_IMAGE_BYTES)? else {
                 return Ok(None);
             };
             if bytes.len() > MAX_IMAGE_BYTES {
@@ -444,6 +472,13 @@ pub fn spawn(tx: Sender<Captured>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn property_reads_ask_for_one_unit_past_the_cap() {
+        assert_eq!(units_for(8), 3);
+        assert_eq!(units_for(MAX_TEXT_BYTES), (MAX_TEXT_BYTES / 4 + 1) as u32);
+        assert_eq!(units_for(usize::MAX), u32::MAX);
+    }
 
     #[test]
     fn suppresses_only_the_matching_text() {

@@ -1,3 +1,4 @@
+use crate::harden;
 use crate::media::{human_size, ImageClip};
 use anyhow::Result;
 use base64::Engine;
@@ -7,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Unpinned entries beyond this count are dropped, oldest first. Pins never expire.
+/// Default cap on unpinned entries, dropped oldest first. Pins never expire.
 const MAX_UNPINNED: usize = 500;
 /// Unpinned entries are also held to a byte budget, because a few dozen
 /// screenshots outweigh thousands of text clips and the count alone will not
@@ -56,6 +57,8 @@ pub struct VaultItem {
 
 pub struct Store {
     conn: Connection,
+    max_unpinned: usize,
+    max_unpinned_bytes: i64,
 }
 
 pub fn now() -> i64 {
@@ -85,16 +88,37 @@ fn preview_of(text: &str) -> (String, bool) {
 }
 
 impl Store {
+    /// Opens or creates the database. The directory is made 0700 and the
+    /// database with its WAL and shared-memory files 0600, tightening files
+    /// left world-readable by earlier versions.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            harden::private_dir(dir)?;
         }
+        // Tighten before SQLite opens it: SQLite gives the -wal and -shm files
+        // the same mode as the database file.
+        harden::private_file(path)?;
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        let store = Store { conn };
+        let store = Store {
+            conn,
+            max_unpinned: MAX_UNPINNED,
+            max_unpinned_bytes: MAX_UNPINNED_BYTES,
+        };
         store.migrate()?;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.as_os_str().to_owned();
+            p.push(suffix);
+            harden::private_file(Path::new(&p))?;
+        }
         Ok(store)
+    }
+
+    /// Replaces the default history limits, e.g. with values from `Config`.
+    pub fn set_limits(&mut self, max_unpinned: usize, max_unpinned_bytes: i64) {
+        self.max_unpinned = max_unpinned;
+        self.max_unpinned_bytes = max_unpinned_bytes;
     }
 
     fn migrate(&self) -> Result<()> {
@@ -227,7 +251,7 @@ impl Store {
     }
 
     fn trim(&self) -> Result<()> {
-        self.trim_to(MAX_UNPINNED, MAX_UNPINNED_BYTES)
+        self.trim_to(self.max_unpinned, self.max_unpinned_bytes)
     }
 
     fn trim_to(&self, max_unpinned: usize, max_bytes: i64) -> Result<()> {
@@ -683,6 +707,38 @@ mod tests {
         // Count allows 5, budget allows about 3.
         s.trim_to(5, 300).unwrap();
         assert!(s.list("", 50).unwrap().len() <= 3);
+    }
+
+    #[test]
+    fn database_files_are_private_even_if_they_were_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir::Dir::new();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let path = data.join("p.db");
+        // A database left behind by the Tauri build, created under umask 022.
+        Store::open(&path).unwrap().record(&Clip::Text("seed".into())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let s = Store::open(&path).unwrap();
+        s.record(&Clip::Text("after reopen".into())).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&data), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&data.join("p.db-wal")), 0o600);
+        assert_eq!(mode(&data.join("p.db-shm")), 0o600);
+    }
+
+    #[test]
+    fn configured_limits_replace_the_defaults() {
+        let (mut s, _d) = store();
+        s.set_limits(3, i64::MAX);
+        for i in 0..10 {
+            s.record(&Clip::Text(format!("entry {i}"))).unwrap();
+        }
+        assert_eq!(s.list("", 50).unwrap().len(), 3);
     }
 
     #[test]

@@ -1,12 +1,30 @@
 //! Decoding, hashing and thumbnailing for image clips.
 
 use anyhow::{anyhow, Result};
-use image::{imageops::FilterType, ImageFormat};
+use image::{imageops::FilterType, DynamicImage, ImageFormat, ImageReader, Limits};
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
 
 /// Longest edge of the thumbnail shown in the history list.
 const THUMB_MAX: u32 = 160;
+
+/// Clipboard images come from whatever application owns the selection, so a
+/// few hundred bytes of PNG may claim to be a gigapixel image. Decoding is
+/// bounded before any pixel buffer is allocated. 16384 px covers an 8K
+/// screenshot with room to spare.
+const MAX_EDGE: u32 = 16_384;
+const MAX_DECODE_ALLOC: u64 = 256 * 1024 * 1024;
+
+fn decode(bytes: &[u8]) -> Result<DynamicImage> {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_EDGE);
+    limits.max_image_height = Some(MAX_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+    reader.limits(limits);
+    Ok(reader.decode()?)
+}
 
 pub struct ImageClip {
     pub png: Vec<u8>,
@@ -30,8 +48,7 @@ fn pixel_hash(width: u32, height: u32, rgba: &[u8]) -> String {
 }
 
 pub fn prepare(bytes: &[u8]) -> Result<ImageClip> {
-    let img = image::load_from_memory(bytes)
-        .map_err(|e| anyhow!("unrecognised image data: {e}"))?;
+    let img = decode(bytes).map_err(|e| anyhow!("unrecognised image data: {e}"))?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
     if width == 0 || height == 0 {
@@ -52,9 +69,7 @@ pub fn prepare(bytes: &[u8]) -> Result<ImageClip> {
 
 /// Decodes a stored PNG back to the raw RGBA that the clipboard wants.
 pub fn to_rgba(png: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
-    let rgba = image::load_from_memory(png)
-        .map_err(|e| anyhow!("stored image is unreadable: {e}"))?
-        .to_rgba8();
+    let rgba = decode(png).map_err(|e| anyhow!("stored image is unreadable: {e}"))?.to_rgba8();
     let (w, h) = rgba.dimensions();
     Ok((w, h, rgba.into_raw()))
 }
@@ -120,5 +135,16 @@ mod tests {
     #[test]
     fn rejects_junk() {
         assert!(prepare(b"not an image at all").is_err());
+    }
+
+    #[test]
+    fn refuses_images_past_the_edge_limit() {
+        // One row of 16385 px compresses to almost nothing, which is exactly the
+        // shape of a decompression bomb: tiny input, oversized claim.
+        let wide = png_fixture(MAX_EDGE + 1, 1, 0);
+        assert!(wide.len() < 1024 * 1024);
+        let err = prepare(&wide).err().expect("must be refused");
+        assert!(err.to_string().contains("unrecognised image"), "{err}");
+        assert!(prepare(&png_fixture(MAX_EDGE, 1, 0)).is_ok(), "the limit itself is allowed");
     }
 }
