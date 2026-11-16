@@ -23,7 +23,37 @@ const PREVIEW_CHARS: usize = 220;
 ///   `vault_items` (wrapped data key, sealed labels, AAD per row). A first-
 ///   generation vault is converted on its next unlock, since that needs the
 ///   password.
-const SCHEMA_VERSION: i64 = 2;
+/// - 3: rows recorded before secret detection existed are scanned once, and
+///   matches are flagged for review.
+const SCHEMA_VERSION: i64 = 3;
+
+/// Whether an entry looks like a credential, and whether anyone decided so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sensitivity {
+    None,
+    /// Found by the upgrade scan; nobody has looked at it yet.
+    Flagged,
+    /// Kept in history on purpose, in plaintext.
+    Kept,
+}
+
+impl Sensitivity {
+    fn from_db(v: i64) -> Self {
+        match v {
+            1 => Sensitivity::Flagged,
+            2 => Sensitivity::Kept,
+            _ => Sensitivity::None,
+        }
+    }
+
+    fn to_db(self) -> i64 {
+        match self {
+            Sensitivity::None => 0,
+            Sensitivity::Flagged => 1,
+            Sensitivity::Kept => 2,
+        }
+    }
+}
 
 pub struct Entry {
     pub id: i64,
@@ -39,9 +69,9 @@ pub struct Entry {
     pub height: Option<i64>,
     /// PNG bytes for the list thumbnail; images only.
     pub thumb: Option<Vec<u8>>,
-    /// Looks like a credential. Only rows kept on purpose, or rows recorded
-    /// before detection existed, can carry this; new ones never reach disk.
-    pub sensitive: bool,
+    /// Only rows kept on purpose, or recorded before detection existed, can
+    /// be anything but `None`: new credentials never reach disk.
+    pub sensitivity: Sensitivity,
 }
 
 /// Something worth remembering off the clipboard.
@@ -194,6 +224,9 @@ impl Store {
         if version < 2 {
             self.migrate_v2()?;
         }
+        if version < 3 {
+            self.migrate_v3()?;
+        }
         Ok(())
     }
 
@@ -300,6 +333,33 @@ impl Store {
         // Anything deleted before secure_delete was turned on still sits in
         // free pages. Rebuilding the file is the only way to drop it.
         self.compact()
+    }
+
+    /// History recorded before detection existed may hold credentials. They
+    /// are flagged rather than deleted: the user decides.
+    fn migrate_v3(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let hits: Vec<i64> = {
+            let mut stmt = tx.prepare("SELECT id, content FROM entries WHERE kind = 'text'")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+            let mut hits = Vec::new();
+            for row in rows {
+                let (id, content) = row?;
+                if crate::secrets::detect(&content).is_some() {
+                    hits.push(id);
+                }
+            }
+            hits
+        };
+        for id in &hits {
+            tx.execute("UPDATE entries SET sensitive = 1 WHERE id = ?1", params![id])?;
+        }
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+        if !hits.is_empty() {
+            log::info!("{} history entries look like credentials and are flagged for review", hits.len());
+        }
+        Ok(())
     }
 
     /// Folds the WAL back into the database and truncates it, so content
@@ -463,7 +523,7 @@ impl Store {
                 width: r.get(9)?,
                 height: r.get(10)?,
                 thumb: r.get(11)?,
-                sensitive: r.get::<_, i64>(12)? != 0,
+                sensitivity: Sensitivity::from_db(r.get(12)?),
             })
         };
         let rows = match like {
@@ -515,12 +575,33 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_sensitive(&self, id: i64, sensitive: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE entries SET sensitive = ?1 WHERE id = ?2",
-            params![sensitive as i64, id],
-        )?;
+    pub fn set_sensitivity(&self, id: i64, s: Sensitivity) -> Result<()> {
+        self.conn.execute("UPDATE entries SET sensitive = ?1 WHERE id = ?2", params![s.to_db(), id])?;
         Ok(())
+    }
+
+    /// Stores a credential in plaintext history because the user chose to,
+    /// pinned so it is not quietly evicted.
+    pub fn keep_sensitive(&self, text: &str) -> Result<i64> {
+        let id = self
+            .record(&Clip::Text(text.to_string()))?
+            .ok_or_else(|| anyhow::anyhow!("nothing to keep"))?;
+        self.set_pinned(id, true)?;
+        self.set_sensitivity(id, Sensitivity::Kept)?;
+        Ok(id)
+    }
+
+    /// Rows the upgrade scan flagged and nobody has reviewed.
+    pub fn flagged_count(&self) -> Result<usize> {
+        let n: i64 =
+            self.conn.query_row("SELECT COUNT(*) FROM entries WHERE sensitive = 1", [], |r| r.get(0))?;
+        Ok(n as usize)
+    }
+
+    pub fn delete_flagged(&self) -> Result<usize> {
+        let n = self.conn.execute("DELETE FROM entries WHERE sensitive = 1", [])?;
+        self.scrub()?;
+        Ok(n)
     }
 
     pub fn delete(&self, id: i64) -> Result<()> {
@@ -943,7 +1024,7 @@ mod tests {
         assert_eq!(user_version(&s), SCHEMA_VERSION);
         let rows = s.list("", 10).unwrap();
         assert_eq!(rows[0].preview, "kept");
-        assert!(!rows[0].sensitive);
+        assert_eq!(rows[0].sensitivity, Sensitivity::None);
         assert!(s.legacy_vault().unwrap().is_some(), "the vault waits for its password");
     }
 
@@ -983,6 +1064,40 @@ mod tests {
         s.delete(b).unwrap();
         assert!(!disk_contains(&d, "t.db", small));
         assert!(!disk_contains(&d, "t.db", "LARGE-MARKER-"));
+    }
+
+    #[test]
+    fn the_upgrade_scan_flags_old_credentials_for_review() {
+        let dir = tempdir::Dir::new();
+        let path = dir.path().join("old.db");
+        let key = ["ghp_", &"a1B2".repeat(9)].concat();
+        {
+            let s = Store::open(&path).unwrap();
+            s.record(&Clip::Text(key.clone())).unwrap();
+            s.record(&Clip::Text("harmless".into())).unwrap();
+            // Pretend this database predates detection.
+            s.conn.execute("UPDATE entries SET sensitive = 0", []).unwrap();
+            s.conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.flagged_count().unwrap(), 1);
+        let rows = s.list("", 10).unwrap();
+        let flagged = rows.iter().find(|e| e.sensitivity == Sensitivity::Flagged).unwrap();
+        assert_eq!(flagged.preview, key);
+
+        assert_eq!(s.delete_flagged().unwrap(), 1);
+        assert_eq!(s.list("", 10).unwrap().len(), 1);
+        assert!(!disk_contains(&dir, "old.db", &key));
+    }
+
+    #[test]
+    fn keeping_a_credential_pins_and_marks_it() {
+        let (s, _d) = store();
+        let id = s.keep_sensitive("deliberately kept").unwrap();
+        let row = s.list("", 10).unwrap().into_iter().find(|e| e.id == id).unwrap();
+        assert!(row.pinned);
+        assert_eq!(row.sensitivity, Sensitivity::Kept);
+        assert_eq!(s.flagged_count().unwrap(), 0, "kept is not awaiting review");
     }
 
     #[test]

@@ -3,8 +3,11 @@
 
 pub mod clipboard;
 pub mod config;
+pub mod ephemeral;
 pub mod harden;
 pub mod media;
+pub mod recorder;
+pub mod secrets;
 pub mod store;
 pub mod vault;
 pub mod watcher;
