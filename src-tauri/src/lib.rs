@@ -1,8 +1,8 @@
 mod commands;
-mod media;
-mod store;
-mod vault;
-mod watcher;
+
+// The logic lives in clipvault-core; these aliases keep `crate::store` and
+// friends resolving while the Tauri shell is still here.
+pub(crate) use clipvault_core::{media, store, vault, watcher};
 
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;

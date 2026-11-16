@@ -1,0 +1,22 @@
+[package]
+name = "clipvault-core"
+description = "Clipboard capture, history store and encrypted vault for ClipVault. No UI."
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+
+rusqlite = { version = "0.32", features = ["bundled"] }
+x11rb = { version = "0.13", features = ["xfixes"] }
+
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand = "0.8"
+sha2 = "0.10"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif"] }
