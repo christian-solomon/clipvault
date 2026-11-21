@@ -33,7 +33,10 @@ actions!(
 );
 
 const CONTEXT: &str = "ClipVault";
-const ROW_HEIGHT: f32 = 46.;
+/// Cards in the lists: their height, and the gap below each.
+const CARD_HEIGHT: f32 = 76.;
+const VAULT_CARD_HEIGHT: f32 = 60.;
+const CARD_GAP: f32 = 8.;
 const BLUR_GRACE: std::time::Duration = std::time::Duration::from_millis(300);
 
 pub fn bind_keys(cx: &mut App) {
@@ -774,24 +777,20 @@ impl Palette {
                                     selected,
                                     |this, window, cx| this.on_delete(&DeleteSelected, window, cx),
                                 ));
-                            h_flex()
-                                .id(("row", ix))
+                            let card = theme::card(&theme, selected)
                                 .group("row")
-                                .w_full()
-                                .h(px(ROW_HEIGHT))
+                                .size_full()
+                                .flex()
+                                .items_center()
                                 .pl_3()
-                                .pr_1()
-                                .gap_2()
-                                .rounded(theme.radius)
-                                .cursor_pointer()
-                                .when(selected, |d| d.bg(theme.accent))
-                                .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
+                                .pr_1p5()
+                                .gap_3()
                                 .when_some(row.thumb.clone(), |d, thumb| {
                                     d.child(
                                         img(thumb)
-                                            .h(px(32.))
-                                            .w(px(48.))
-                                            .rounded_sm()
+                                            .h(px(48.))
+                                            .w(px(72.))
+                                            .rounded(theme.radius)
                                             .object_fit(ObjectFit::Cover),
                                     )
                                 })
@@ -799,11 +798,14 @@ impl Palette {
                                     v_flex()
                                         .flex_1()
                                         .min_w_0()
+                                        .gap_1()
                                         .child(
                                             div()
                                                 .text_sm()
-                                                .truncate()
-                                                .when(row.image, |d| d.italic())
+                                                .when(row.image, |d| d.italic().truncate())
+                                                .when(!row.image, |d| {
+                                                    d.whitespace_normal().line_clamp(2)
+                                                })
                                                 .child(row.title.clone()),
                                         )
                                         .child(
@@ -821,7 +823,14 @@ impl Palette {
                                                 .child(row.meta.clone()),
                                         ),
                                 )
-                                .child(actions)
+                                .child(actions);
+                            div()
+                                .id(("row", ix))
+                                .w_full()
+                                .h(px(CARD_HEIGHT + CARD_GAP))
+                                .pb(px(CARD_GAP))
+                                .cursor_pointer()
+                                .child(card)
                                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                                     this.state.update(cx, |s, cx| s.select(ix, cx));
                                     if ev.click_count() >= 2 {
@@ -834,7 +843,8 @@ impl Palette {
             )
             .track_scroll(&self.list_scroll)
             .flex_1()
-            .p_1()
+            .px_2()
+            .pt_2()
             .into_any_element()
         };
 
@@ -1051,33 +1061,31 @@ impl Palette {
                                         .map(|v| v.to_string())
                                         .unwrap_or_else(|| "••••••••".into())
                                         .into();
-                                    h_flex()
-                                        .id(("vault-row", ix))
-                                        .w_full()
-                                        .h(px(ROW_HEIGHT))
-                                        .px_3()
-                                        .gap_3()
-                                        .rounded(theme.radius)
-                                        .cursor_pointer()
-                                        .when(selected, |d| d.bg(theme.accent))
-                                        .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
+                                    let card = theme::card(&theme, selected)
+                                        .size_full()
+                                        .flex()
+                                        .flex_col()
+                                        .justify_center()
+                                        .gap_1()
+                                        .px_4()
                                         .child(
-                                            div()
-                                                .w(px(220.))
-                                                .text_sm()
-                                                .truncate()
-                                                .child(item.label.clone()),
+                                            theme::heading(item.label.clone()).text_sm().truncate(),
                                         )
                                         .child(
                                             div()
-                                                .flex_1()
-                                                .min_w_0()
                                                 .truncate()
                                                 .font_family(theme.mono_font_family.clone())
                                                 .text_xs()
                                                 .text_color(theme.muted_foreground)
                                                 .child(shown),
-                                        )
+                                        );
+                                    div()
+                                        .id(("vault-row", ix))
+                                        .w_full()
+                                        .h(px(VAULT_CARD_HEIGHT + CARD_GAP))
+                                        .pb(px(CARD_GAP))
+                                        .cursor_pointer()
+                                        .child(card)
                                         .on_click(cx.listener(
                                             move |this, ev: &ClickEvent, window, cx| {
                                                 this.state
@@ -1093,7 +1101,8 @@ impl Palette {
                     )
                     .track_scroll(&self.vault_scroll)
                     .flex_1()
-                    .p_1()
+                    .px_2()
+                    .pt_2()
                     .into_any_element()
                 };
                 v_flex()

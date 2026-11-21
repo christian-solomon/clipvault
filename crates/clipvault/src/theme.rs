@@ -5,7 +5,10 @@
 
 use std::borrow::Cow;
 
-use gpui::{div, px, App, Div, FontWeight, ParentElement, Pixels, SharedString, Styled};
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    div, px, App, Div, FontWeight, InteractiveElement, ParentElement, Pixels, SharedString, Styled,
+};
 use gpui_component::{Theme, ThemeRegistry};
 
 const THEMES: &str = include_str!("../../../assets/themes/mist.json");
@@ -56,6 +59,24 @@ pub fn radius_sm(theme: &Theme) -> Pixels {
 
 pub fn radius_lg(theme: &Theme) -> Pixels {
     theme.radius * 1.25
+}
+
+/// A shadcn card: the card colour, the large radius, a faint ring and a small
+/// shadow. A selected card takes the accent colour and the focus ring.
+pub fn card(theme: &Theme, selected: bool) -> Div {
+    let (bg, ring) = if selected {
+        (theme.accent, theme.ring)
+    } else {
+        (theme.group_box, theme.foreground.opacity(0.1))
+    };
+    let hover = theme.muted;
+    div()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(ring)
+        .bg(bg)
+        .shadow_xs()
+        .when(!selected, |d| d.hover(|d| d.bg(hover)))
 }
 
 /// A small tinted pill, like a shadcn badge.

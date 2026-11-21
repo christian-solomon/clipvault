@@ -58,6 +58,9 @@ MAP = {
     "muted.background": "muted",
     "muted.foreground": "muted-foreground",
     "popover.background": "popover",
+    # gpui-component's card-like container.
+    "group_box.background": "card",
+    "group_box.foreground": "card-foreground",
     "popover.foreground": "popover-foreground",
     "primary.background": "primary",
     "primary.foreground": "primary-foreground",
