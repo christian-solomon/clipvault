@@ -78,6 +78,24 @@ Resident memory, measured on an Intel Iris Xe laptop (Mesa Vulkan):
 Hiding destroys the window and its surface, but the GPU driver and renderer
 state loaded on first show stay mapped until the app exits.
 
+## Theme
+
+The look is the shadcn/ui preset `b3ezFPvD9s`: the vega style, the mist palette
+(a cool blue-grey), Inter for text, Geist for headings, and a 10 px base radius.
+`assets/themes/mist.json` holds its light and dark tokens as a gpui-component
+theme, and follows the desktop's light or dark setting.
+
+Regenerate it from this or another preset (shadcn's public init endpoint
+supplies the tokens):
+
+```bash
+python3 scripts/shadcn-theme.py b3ezFPvD9s assets/themes/mist.json
+```
+
+Inter and Geist are embedded in the binary (`assets/fonts`, SIL Open Font
+License). Icons stay Lucide, the set gpui-component draws its own controls
+with, rather than the preset's Hugeicons.
+
 ## Configuration
 
 Everything comes from the environment; an unset variable takes the default and

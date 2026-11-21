@@ -2,10 +2,10 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
-use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, StyledExt, Theme, ThemeMode, WindowExt,
+    h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, Theme, ThemeMode, WindowExt,
 };
 use gpui_kit_assets::IconName as AssetIcon;
 use zeroize::Zeroizing;
@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 use clipvault_core::vault::Status;
 
 use crate::app::{AppState, Badge, Preview, RowId, Tab};
-use crate::x11;
+use crate::{theme, x11};
 
 actions!(
     clipvault,
@@ -345,7 +345,7 @@ impl Palette {
             let state = state.clone();
             alert
                 .confirm()
-                .title("Keep this in history?")
+                .title(theme::heading("Keep this in history?"))
                 .description(
                     "It looks like a credential. History is stored unencrypted on disk. \
                      Ctrl+S moves it into the vault instead.",
@@ -392,7 +392,7 @@ impl Palette {
             let (state, label) = (state.clone(), label.clone());
             alert
                 .confirm()
-                .title("Move into the vault")
+                .title(theme::heading("Move into the vault"))
                 .description(
                     v_flex()
                         .gap_2()
@@ -435,9 +435,10 @@ impl Palette {
                     let state = state.clone();
                     alert
                         .confirm()
-                        .title("Delete from history?")
+                        .title(theme::heading("Delete from history?"))
                         .description(format!("Delete {what}? This cannot be undone."))
                         .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
                         .on_ok(move |_, window, cx| {
                             if let Err(e) = state.update(cx, |s, cx| s.delete_row(row.id, cx)) {
                                 window.push_notification(format!("{e:#}"), cx);
@@ -455,9 +456,10 @@ impl Palette {
                     let (state, item) = (state.clone(), item.clone());
                     alert
                         .confirm()
-                        .title("Delete from the vault?")
+                        .title(theme::heading("Delete from the vault?"))
                         .description(format!("Delete \"{}\"? This cannot be undone.", item.label))
                         .ok_text("Delete")
+                        .ok_variant(ButtonVariant::Danger)
                         .on_ok(move |_, window, cx| {
                             if let Err(e) = state.update(cx, |s, cx| s.vault_delete(item.id, cx)) {
                                 window.push_notification(format!("{e:#}"), cx);
@@ -503,7 +505,7 @@ impl Palette {
             let (state, label, secret) = (state.clone(), label.clone(), secret.clone());
             alert
                 .confirm()
-                .title("New secret")
+                .title(theme::heading("New secret"))
                 .description(
                     v_flex()
                         .gap_2()
@@ -546,7 +548,7 @@ impl Palette {
                 (state.clone(), current.clone(), new.clone(), again.clone());
             alert
                 .confirm()
-                .title("Change master password")
+                .title(theme::heading("Change master password"))
                 .description(
                     v_flex()
                         .gap_2()
@@ -627,17 +629,29 @@ impl Palette {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let tab = self.tab(cx);
+        let dark = theme.mode.is_dark();
+        // shadcn's tabs: a muted track; the active tab is lifted out of it.
         let tab_button = |id: &'static str, label: &'static str, this_tab: Tab| {
             let active = tab == this_tab;
             div()
                 .id(id)
-                .px_3()
-                .py_1()
+                .px_2p5()
+                .py_0p5()
                 .rounded(theme.radius)
+                .border_1()
+                .border_color(gpui::transparent_black())
                 .text_sm()
+                .font_weight(FontWeight::MEDIUM)
                 .cursor_pointer()
-                .when(active, |d| d.bg(theme.secondary).text_color(theme.foreground))
-                .when(!active, |d| d.text_color(theme.muted_foreground))
+                .when(active, |d| {
+                    d.bg(theme.tab_active)
+                        .text_color(theme.tab_active_foreground)
+                        .when(dark, |d| d.border_color(theme.input))
+                        .when(!dark, |d| d.shadow_xs())
+                })
+                .when(!active, |d| {
+                    d.text_color(theme.tab_foreground).hover(|d| d.text_color(theme.foreground))
+                })
                 .child(label)
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.set_tab(this_tab, window, cx)),
@@ -655,16 +669,13 @@ impl Palette {
                     .when(tab == Tab::History, |d| {
                         d.child(Input::new(&self.search).cleanable(true).appearance(false))
                     })
-                    .when(tab == Tab::Vault, |d| {
-                        d.child(div().text_sm().font_semibold().child("Vault"))
-                    }),
+                    .when(tab == Tab::Vault, |d| d.child(theme::heading("Vault").text_sm())),
             )
             .child(
                 h_flex()
-                    .gap_1()
-                    .p_0p5()
-                    .rounded(theme.radius)
-                    .bg(theme.muted)
+                    .p(px(3.))
+                    .rounded(theme::radius_lg(theme))
+                    .bg(theme.tab_bar_segmented)
                     .child(tab_button("tab-history", "History", Tab::History))
                     .child(tab_button("tab-vault", "Vault", Tab::Vault)),
             )
@@ -773,7 +784,7 @@ impl Palette {
                                 .gap_2()
                                 .rounded(theme.radius)
                                 .cursor_pointer()
-                                .when(selected, |d| d.bg(theme.list_active))
+                                .when(selected, |d| d.bg(theme.accent))
                                 .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
                                 .when_some(row.thumb.clone(), |d, thumb| {
                                     d.child(
@@ -801,7 +812,11 @@ impl Palette {
                                                 .text_xs()
                                                 .text_color(theme.muted_foreground)
                                                 .when_some(badge, |d, (text, color)| {
-                                                    d.child(div().text_color(color).child(text))
+                                                    d.child(theme::badge(
+                                                        text,
+                                                        color,
+                                                        theme.mode.is_dark(),
+                                                    ))
                                                 })
                                                 .child(row.meta.clone()),
                                         ),
@@ -831,7 +846,8 @@ impl Palette {
                         .gap_2()
                         .px_3()
                         .py_1p5()
-                        .bg(theme.danger.opacity(0.12))
+                        .bg(theme.danger.opacity(0.06))
+                        .text_color(theme.danger)
                         .text_xs()
                         .child(div().flex_1().child(format!(
                             "{flagged} saved {} from before this update look like credentials.",
@@ -956,11 +972,14 @@ impl Palette {
                     .items_center()
                     .justify_center()
                     .gap_3()
-                    .child(div().text_lg().font_semibold().child(if creating {
-                        "Create your vault"
-                    } else {
-                        "Unlock the vault"
-                    }))
+                    .child(
+                        theme::heading(if creating {
+                            "Create your vault"
+                        } else {
+                            "Unlock the vault"
+                        })
+                        .text_lg(),
+                    )
                     .child(
                         div()
                             .max_w(px(420.))
@@ -1040,7 +1059,7 @@ impl Palette {
                                         .gap_3()
                                         .rounded(theme.radius)
                                         .cursor_pointer()
-                                        .when(selected, |d| d.bg(theme.list_active))
+                                        .when(selected, |d| d.bg(theme.accent))
                                         .when(!selected, |d| d.hover(|d| d.bg(theme.list_hover)))
                                         .child(
                                             div()
@@ -1159,10 +1178,15 @@ impl Palette {
                     .gap_1()
                     .child(
                         div()
+                            .h(px(20.))
+                            .min_w(px(20.))
                             .px_1()
-                            .rounded_sm()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(theme::radius_sm(theme))
                             .bg(theme.muted)
-                            .text_color(theme.foreground)
+                            .font_weight(FontWeight::MEDIUM)
                             .child(*k),
                     )
                     .child(*v)

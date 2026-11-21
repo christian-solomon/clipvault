@@ -5,6 +5,7 @@ mod appearance;
 mod assets;
 mod hotkey;
 mod locker;
+mod theme;
 mod tray;
 mod ui;
 mod x11;
@@ -179,6 +180,7 @@ fn run(args: &[String]) -> Result<()> {
         .with_quit_mode(QuitMode::Explicit)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            theme::init(cx);
             ui::bind_keys(cx);
             let state = cx.new(|cx| AppState::new(cfg, store, ephemeral, clipboard, dark, cx));
             let st = state.clone();
