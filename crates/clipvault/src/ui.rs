@@ -5,7 +5,7 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
-    h_flex, v_flex, ActiveTheme, Icon, IconName, Sizable, Theme, ThemeMode, WindowExt,
+    h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, Theme, ThemeMode, WindowExt,
 };
 use gpui_kit_assets::IconName as AssetIcon;
 use zeroize::Zeroizing;
@@ -773,6 +773,7 @@ impl Palette {
                                           icon: Icon,
                                           tip: &'static str,
                                           shown: bool,
+                                          enabled: bool,
                                           act: fn(&mut Self, &mut Window, &mut Context<Self>)| {
                                 div()
                                     .when(!shown, |d| {
@@ -784,6 +785,7 @@ impl Palette {
                                             .xsmall()
                                             .icon(icon)
                                             .tooltip(tip)
+                                            .disabled(!enabled)
                                             .on_click(cx.listener(
                                                 move |this, _: &ClickEvent, window, cx| {
                                                     cx.stop_propagation();
@@ -801,28 +803,41 @@ impl Palette {
                             let actions = h_flex()
                                 .flex_none()
                                 .child(action(
+                                    "copy",
+                                    Icon::new(IconName::Copy),
+                                    "Copy and close (Enter)",
+                                    selected,
+                                    true,
+                                    |this, window, cx| this.on_confirm(&Confirm, window, cx),
+                                ))
+                                .child(action(
                                     "pin",
                                     pin_icon,
                                     if row.pinned { "Unpin (Ctrl+P)" } else { "Pin (Ctrl+P)" },
                                     selected || row.pinned,
+                                    true,
                                     |this, window, cx| this.on_toggle_pin(&TogglePin, window, cx),
                                 ))
-                                .when(!row.image, |d| {
-                                    d.child(action(
-                                        "vault",
-                                        Icon::new(AssetIcon::Lock),
-                                        "Move into the vault (Ctrl+S)",
-                                        selected,
-                                        |this, window, cx| {
-                                            this.on_move_to_vault(&MoveToVault, window, cx)
-                                        },
-                                    ))
-                                })
+                                .child(action(
+                                    "vault",
+                                    Icon::new(AssetIcon::Lock),
+                                    if row.image {
+                                        "The vault holds text, not images"
+                                    } else {
+                                        "Move into the vault (Ctrl+S)"
+                                    },
+                                    selected,
+                                    !row.image,
+                                    |this, window, cx| {
+                                        this.on_move_to_vault(&MoveToVault, window, cx)
+                                    },
+                                ))
                                 .child(action(
                                     "delete",
                                     Icon::new(AssetIcon::Trash),
                                     "Delete (Shift+Delete)",
                                     selected,
+                                    true,
                                     |this, window, cx| this.on_delete(&DeleteSelected, window, cx),
                                 ));
                             let card = theme::card(&theme, selected)
@@ -852,7 +867,9 @@ impl Palette {
                                                 .text_sm()
                                                 .when(row.image, |d| d.italic().truncate())
                                                 .when(!row.image, |d| {
-                                                    d.whitespace_normal().line_clamp(2)
+                                                    d.whitespace_normal()
+                                                        .line_clamp(2)
+                                                        .text_ellipsis()
                                                 })
                                                 .child(row.title.clone()),
                                         )

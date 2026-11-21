@@ -34,6 +34,7 @@ mod tests {
     #[test]
     fn every_row_icon_loads() {
         let paths = [
+            IconName::Copy.path(),
             IconName::Star.path(),
             IconName::StarFill.path(),
             gpui_kit_assets::IconName::Lock.path(),
