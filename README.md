@@ -129,6 +129,9 @@ field, so ciphertexts swapped between rows fail to decrypt. Labels are
 encrypted: while locked, only the number of secrets is visible. Changing the
 password rewraps the data key. Deleting needs the vault unlocked, and repeated
 wrong passwords back off.
+A lost password cannot be recovered. The unlock screen's reset deletes the whole
+vault so a new one can be made; it needs no password because it reveals
+nothing.
 
 The vault locks after `CLIPVAULT_AUTOLOCK_MINUTES` idle, when the screen locks
 (GNOME and freedesktop screensaver signals, logind `Lock`) and before suspend

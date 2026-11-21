@@ -165,6 +165,11 @@ impl Palette {
                 {
                     this.password.update(cx, |s, cx| s.focus(window, cx));
                 }
+                // Reset: the old error no longer applies; a new password goes here.
+                if this.last_status == Status::Locked && status == Status::Absent {
+                    this.gate_error = None;
+                    this.password.update(cx, |s, cx| s.focus(window, cx));
+                }
                 this.last_status = status;
                 cx.notify();
             }),
@@ -591,6 +596,49 @@ impl Palette {
     /// Unlock, or create the vault. The password is read once into a
     /// self-wiping string and the fields are emptied straight away; the KDF
     /// runs in the background.
+    fn ask_reset_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = self.state.read(cx).vault_count;
+        let (description, ok) = match count {
+            0 => (
+                "The vault holds no secrets. You then choose a new password.".to_string(),
+                "Reset the vault".to_string(),
+            ),
+            n => {
+                let secrets = if n == 1 { "secret" } else { "secrets" };
+                (
+                    format!(
+                        "This deletes the {n} encrypted {secrets}. Without the password they \
+                         cannot be recovered. You then choose a new password."
+                    ),
+                    format!("Delete {n} {secrets}"),
+                )
+            }
+        };
+        let state = self.state.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let state = state.clone();
+            alert
+                .confirm()
+                .title(theme::heading("Reset the vault?"))
+                .description(description.clone())
+                .ok_text(ok.clone())
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let task = state.update(cx, |s, cx| s.reset_vault(cx));
+                    window
+                        .spawn(cx, async move |cx| {
+                            let msg: SharedString = match task.await {
+                                Ok(()) => "Vault reset. Choose a new password.".into(),
+                                Err(e) => format!("{e:#}").into(),
+                            };
+                            let _ = cx.update(|window, cx| window.push_notification(msg, cx));
+                        })
+                        .detach();
+                    true
+                })
+        });
+    }
+
     fn submit_gate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (creating, busy) = {
             let s = self.state.read(cx);
@@ -1030,6 +1078,17 @@ impl Palette {
                     )
                     .when_some(self.gate_error.clone(), |d, err| {
                         d.child(div().text_sm().text_color(theme.danger).child(err))
+                    })
+                    .when(!creating && !s.busy, |d| {
+                        d.child(
+                            Button::new("gate-reset")
+                                .link()
+                                .small()
+                                .label("Forgot the password? Reset the vault")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.ask_reset_vault(window, cx)
+                                })),
+                        )
                     })
                     .into_any_element()
             }

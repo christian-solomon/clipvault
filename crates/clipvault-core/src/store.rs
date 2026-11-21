@@ -753,6 +753,20 @@ impl Store {
         self.conn.execute("DELETE FROM vault_items WHERE id = ?1", params![id])?;
         self.scrub()
     }
+
+    /// Removes the vault, either generation, and rebuilds the file so none of
+    /// it, the first generation's plaintext labels included, stays on disk.
+    pub fn reset_vault(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute_batch(
+            "DELETE FROM vault_items;
+             DELETE FROM vault_key;
+             DROP TABLE IF EXISTS vault_entries;
+             DROP TABLE IF EXISTS vault_meta;",
+        )?;
+        tx.commit()?;
+        self.compact()
+    }
 }
 
 fn insert_key(conn: &Connection, key: &VaultKeyRow, verb: &str) -> Result<()> {

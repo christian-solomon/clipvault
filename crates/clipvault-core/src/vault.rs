@@ -378,6 +378,15 @@ impl Vault {
         self.touch();
         Ok(())
     }
+
+    /// Destroys the whole vault without its password, the way out when the
+    /// password is lost. It reveals nothing, so it does not need one.
+    pub fn reset(&mut self, store: &Store) -> Result<()> {
+        self.lock();
+        self.failures = 0;
+        self.retry_at = None;
+        store.reset_vault()
+    }
 }
 
 fn wrap(dek: &[u8; 32], password: &str, params: KdfParams) -> Result<VaultKeyRow> {
@@ -707,6 +716,42 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn reset_removes_a_legacy_vault_without_its_password() {
+        let (s, mut v, d) = fixture();
+        write_legacy_vault(&s, PW, &[("LEGACY-LABEL-forgotten", "pg-password-1")]);
+        for _ in 0..3 {
+            assert!(v.unlock(&s, "not the password").is_err());
+        }
+
+        v.reset(&s).unwrap();
+        assert_eq!(v.status(&s).unwrap(), Status::Absent);
+        assert_eq!(Vault::count(&s).unwrap(), 0);
+        assert!(s.legacy_vault().unwrap().is_none());
+        assert!(!contains(&disk_bytes(&d), "LEGACY-LABEL-forgotten"), "plaintext label purged");
+
+        // A fresh vault works at once: the back-off from the failures is gone.
+        v.init(&s, "a new password").unwrap();
+        v.add(&s, "fresh", "new secret").unwrap();
+        v.lock();
+        v.unlock(&s, "a new password").unwrap();
+        assert_eq!(v.items(&s).unwrap()[0].label, "fresh");
+    }
+
+    #[test]
+    fn reset_removes_a_current_vault_and_locks_it() {
+        let (s, mut v, _d) = fixture();
+        v.init(&s, PW).unwrap();
+        v.add(&s, "one", "secret one").unwrap();
+        v.add(&s, "two", "secret two").unwrap();
+
+        v.reset(&s).unwrap();
+        assert!(!v.is_unlocked(), "the old key is dropped");
+        assert_eq!(v.status(&s).unwrap(), Status::Absent);
+        assert_eq!(Vault::count(&s).unwrap(), 0);
+        assert!(v.unlock(&s, PW).is_err(), "the old password opens nothing");
     }
 
     #[test]

@@ -586,6 +586,30 @@ impl AppState {
         })
     }
 
+    /// Destroys the vault when its password is lost. The file rewrite runs off
+    /// the UI thread, on its own connection.
+    pub fn reset_vault(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let (vault, db) = (self.vault.clone(), self.cfg.db_path());
+        self.busy = true;
+        self.revealed = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = Store::open(&db)?;
+                    vault.lock().unwrap().reset(&store)
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                s.busy = false;
+                s.refresh_vault();
+                cx.notify();
+            })?;
+            result
+        })
+    }
+
     pub fn lock_vault(&mut self, cx: &mut Context<Self>) {
         let was_open = {
             let mut vault = self.vault.lock().unwrap();
