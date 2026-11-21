@@ -468,6 +468,46 @@ impl AppState {
         Ok(())
     }
 
+    /// Entries a clear would take: unpinned history plus memory-only clips,
+    /// and pinned history separately.
+    pub fn history_counts(&self) -> (usize, usize) {
+        let memory = self.ephemeral.lock().unwrap().items().len();
+        let (loose, pinned) = self.store.lock().unwrap().history_counts().unwrap_or((0, 0));
+        (loose + memory, pinned)
+    }
+
+    /// Deletes the history, pinned entries too if asked, and the memory-only
+    /// clips; the vault is untouched. The file is rebuilt off the UI thread so
+    /// the space is returned.
+    pub fn clear_history(
+        &mut self,
+        include_pinned: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<usize>> {
+        let memory = {
+            let mut ephemeral = self.ephemeral.lock().unwrap();
+            let n = ephemeral.items().len();
+            ephemeral.clear();
+            n
+        };
+        let db = self.cfg.db_path();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let store = Store::open(&db)?;
+                    let n = store.clear(include_pinned)?;
+                    if let Err(e) = store.compact() {
+                        log::warn!("history cleared, but the file was not compacted: {e:#}");
+                    }
+                    Ok(n)
+                })
+                .await;
+            this.update(cx, |s, cx| s.refresh(cx))?;
+            result.map(|n| n + memory)
+        })
+    }
+
     pub fn delete_flagged(&mut self, cx: &mut Context<Self>) -> Result<usize> {
         let n = self.store.lock().unwrap().delete_flagged()?;
         self.refresh(cx);

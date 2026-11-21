@@ -60,8 +60,9 @@ To start at login, put a desktop entry in `~/.config/autostart/` with
 | `Tab` | switch tab | switch tab |
 | `Esc` | close | close |
 
-History rows also have buttons for pin, move into the vault and delete, shown
-on the selected or hovered row.
+History cards also have buttons for copy, pin, move into the vault and delete,
+shown on the selected or hovered card. **Clear history** deletes every unpinned
+entry, pinned ones too if you tick the box, and never touches the vault.
 
 The window is created when shown and destroyed when hidden, and it hides when
 it loses focus.

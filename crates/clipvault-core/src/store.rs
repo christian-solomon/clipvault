@@ -600,14 +600,26 @@ impl Store {
         self.scrub()
     }
 
-    /// Clears history. Pinned entries survive unless `include_pinned`.
-    pub fn clear(&self, include_pinned: bool) -> Result<()> {
-        if include_pinned {
-            self.conn.execute("DELETE FROM entries", [])?;
+    /// Clears history and returns how many entries went. Pinned entries
+    /// survive unless `include_pinned`; the vault is not history.
+    pub fn clear(&self, include_pinned: bool) -> Result<usize> {
+        let n = if include_pinned {
+            self.conn.execute("DELETE FROM entries", [])?
         } else {
-            self.conn.execute("DELETE FROM entries WHERE pinned = 0", [])?;
-        }
-        self.scrub()
+            self.conn.execute("DELETE FROM entries WHERE pinned = 0", [])?
+        };
+        self.scrub()?;
+        Ok(n)
+    }
+
+    /// Unpinned and pinned history entries.
+    pub fn history_counts(&self) -> Result<(usize, usize)> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FILTER (WHERE pinned = 0), COUNT(*) FILTER (WHERE pinned != 0)
+             FROM entries",
+            [],
+            |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, i64>(1)? as usize)),
+        )?)
     }
 
     // ---- vault ---------------------------------------------------------
@@ -1112,6 +1124,36 @@ mod tests {
         s.record(&Clip::Text("CLEAR-MARKER-one".into())).unwrap();
         s.clear(false).unwrap();
         assert!(!disk_contains(&d, "t.db", "CLEAR-MARKER-one"));
+    }
+
+    #[test]
+    fn clearing_keeps_pinned_entries_unless_asked() {
+        let (s, _d) = store();
+        let keep = s.record(&Clip::Text("pinned one".into())).unwrap().unwrap();
+        s.record(&Clip::Text("loose one".into())).unwrap();
+        s.record(&Clip::Text("loose two".into())).unwrap();
+        s.set_pinned(keep, true).unwrap();
+        assert_eq!(s.history_counts().unwrap(), (2, 1));
+
+        assert_eq!(s.clear(false).unwrap(), 2);
+        assert_eq!(s.history_counts().unwrap(), (0, 1));
+        assert_eq!(s.list("", 10).unwrap()[0].id, keep);
+
+        assert_eq!(s.clear(true).unwrap(), 1);
+        assert_eq!(s.history_counts().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn clearing_history_leaves_the_vault_alone() {
+        let (s, _d) = store();
+        s.record(&Clip::Text("history".into())).unwrap();
+        let mut vault = crate::vault::Vault::default();
+        vault.init(&s, "a password").unwrap();
+        vault.add(&s, "label", "vault secret").unwrap();
+
+        s.clear(true).unwrap();
+        assert_eq!(crate::vault::Vault::count(&s).unwrap(), 1);
+        assert_eq!(&*vault.reveal(&s, vault.items(&s).unwrap()[0].id).unwrap(), "vault secret");
     }
 
     #[test]

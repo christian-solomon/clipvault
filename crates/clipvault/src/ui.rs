@@ -2,7 +2,11 @@
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{
     h_flex, v_flex, ActiveTheme, Disableable, Icon, IconName, Sizable, Theme, ThemeMode, WindowExt,
@@ -596,6 +600,59 @@ impl Palette {
     /// Unlock, or create the vault. The password is read once into a
     /// self-wiping string and the fields are emptied straight away; the KDF
     /// runs in the background.
+    fn ask_clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (loose, pinned) = self.state.read(cx).history_counts();
+        if loose + pinned == 0 {
+            self.toast(window, cx, "History is already empty");
+            return;
+        }
+        let entries = |n: usize| if n == 1 { "entry" } else { "entries" };
+        // Pinned entries are kept unless the box is ticked; with nothing
+        // unpinned, deleting the pinned ones is the only thing left to do.
+        let include_pinned = Rc::new(Cell::new(loose == 0));
+        let state = self.state.clone();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let (state, include) = (state.clone(), include_pinned.clone());
+            let all = include.get();
+            let n = loose + if all { pinned } else { 0 };
+            let mut body = v_flex().gap_3().child(format!(
+                "This deletes {n} {} from history. The vault is not touched.",
+                entries(n)
+            ));
+            if pinned > 0 && loose > 0 {
+                let include = include.clone();
+                body = body.child(
+                    Checkbox::new("clear-pinned")
+                        .label(format!("Also delete the {pinned} pinned {}", entries(pinned)))
+                        .checked(all)
+                        .on_click(move |checked, window, _| {
+                            include.set(*checked);
+                            window.refresh();
+                        }),
+                );
+            }
+            alert
+                .confirm()
+                .title(theme::heading("Clear history?"))
+                .description(body)
+                .ok_text(format!("Delete {n} {}", entries(n)))
+                .ok_variant(ButtonVariant::Danger)
+                .on_ok(move |_, window, cx| {
+                    let task = state.update(cx, |s, cx| s.clear_history(include.get(), cx));
+                    window
+                        .spawn(cx, async move |cx| {
+                            let msg: SharedString = match task.await {
+                                Ok(n) => format!("Cleared {n} {}", entries(n)).into(),
+                                Err(e) => format!("{e:#}").into(),
+                            };
+                            let _ = cx.update(|window, cx| window.push_notification(msg, cx));
+                        })
+                        .detach();
+                    true
+                })
+        });
+    }
+
     fn ask_reset_vault(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let count = self.state.read(cx).vault_count;
         let (description, ok) = match count {
@@ -722,6 +779,18 @@ impl Palette {
                     })
                     .when(tab == Tab::Vault, |d| d.child(theme::heading("Vault").text_sm())),
             )
+            .when(tab == Tab::History, |d| {
+                d.child(
+                    Button::new("clear-history")
+                        .ghost()
+                        .small()
+                        .label("Clear history")
+                        .tooltip("Delete history entries; the vault is kept")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.ask_clear_history(window, cx)),
+                        ),
+                )
+            })
             .child(
                 h_flex()
                     .p(px(3.))
