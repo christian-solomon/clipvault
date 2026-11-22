@@ -1034,7 +1034,7 @@ dependencies = [
 
 [[package]]
 name = "clipvault"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "clipvault-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",

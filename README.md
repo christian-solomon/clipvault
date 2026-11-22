@@ -112,11 +112,58 @@ an invalid one stops startup with an error naming it.
 | `CLIPVAULT_HISTORY_MAX_ENTRIES` | `500` | unpinned entries kept |
 | `CLIPVAULT_HISTORY_MAX_BYTES` | `268435456` | byte budget for unpinned entries |
 | `CLIPVAULT_ALLOW_DEBUGGER` | unset | `1` keeps the process dumpable |
+| `CLIPVAULT_MONGODB_URL` | unset | sync database; without it ClipVault is local-only |
+| `CLIPVAULT_MONGODB_DB` | `clipvault` | database name within it |
+| `CLIPVAULT_DEVICE_NAME` | host name | shown on other devices next to clips copied here |
+| `CLIPVAULT_SYNC_ADOPT` | `1` | `0` stops other devices' copies landing on this clipboard |
 | `RUST_LOG` | `warn,clipvault=info,clipvault_core=info` | log filter; logs go to stdout |
 
 The history database is local state by design: a clipboard manager that forgot
 everything on restart would not be one. Its location is configuration like any
-other.
+other. With sync on it is a working copy of the account. A synced device also
+keeps one key in the OS keyring (see Sync).
+
+## Sync
+
+With `CLIPVAULT_MONGODB_URL` set, history and the vault sync through MongoDB
+between every device that uses the account. Copying on one device puts the
+copy on the others' clipboards within seconds. Each device keeps its full
+local copy, so search stays instant and nothing stops working offline.
+
+Everything readable is encrypted on the device before it is sent. The
+database holds a single account record with two keys, both sealed under
+the master password:
+- the **vault key**, which never leaves memory and is needed afresh for each
+  vault unlock;
+- the **history key**, which a device keeps in its OS keyring after the first
+  unlock, so history syncs without asking again.
+
+The format is specified in [`docs/sync.md`](docs/sync.md), for the Windows and
+mobile clients.
+
+Setting up:
+
+1. Create a MongoDB database user limited to `readWrite` on the sync
+   database. Keep its connection string out of files; the launcher below
+   reads it from Infisical.
+2. Start ClipVault with the URL in its environment, for example:
+
+   ```bash
+   infisical run --projectId <id> --env prod -- clipvault --no-hotkey
+   ```
+
+3. The header chip says **Set up sync** on the first device. Choose the
+   master password there, or use the vault's password if this device
+   already has a vault. On every other device the chip says **Unlock sync**:
+   enter the same password once.
+
+The vault's password and the sync password are the same password. Changing
+it on one device reaches the others. A reset of a forgotten vault password
+deletes the vault on every device, but keeps the account, so history keeps
+syncing.
+
+Copies that look like credentials are still kept in memory only, and never
+synced.
 
 ## Security
 
@@ -166,7 +213,13 @@ memory. The single-instance socket sits in a 0700 directory under
 ### What is not
 
 - **History is plaintext on disk** apart from the detection above. A credential
-  that matches no pattern is stored like any other text.
+  that matches no pattern is stored like any other text. In the sync database
+  it is encrypted. What the database does see:
+  - when each item was copied and last used, and how often;
+  - whether it is pinned;
+  - its size;
+  - which device made each change;
+  - that the same item was copied twice.
 - **X11 has no isolation between clients.** Any program on the same display can
   read the clipboard and the keyboard. ClipVault cannot change that.
 - **Deleted data on the disk itself.** The database files are scrubbed, but
