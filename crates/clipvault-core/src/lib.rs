@@ -12,5 +12,6 @@ pub mod media;
 pub mod recorder;
 pub mod secrets;
 pub mod store;
+pub mod sync;
 pub mod vault;
 pub mod watcher;

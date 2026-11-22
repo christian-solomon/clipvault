@@ -40,7 +40,7 @@ fn item_aad(uid: &[u8], field: &str) -> Vec<u8> {
     aad
 }
 
-fn check_password(password: &str) -> Result<()> {
+pub(crate) fn check_password(password: &str) -> Result<()> {
     if password.chars().count() < MIN_PASSWORD_CHARS {
         bail!("master password must be at least {MIN_PASSWORD_CHARS} characters");
     }
@@ -326,7 +326,29 @@ fn wrap(dek: &[u8; 32], password: &str, params: KdfParams) -> Result<VaultKeyRow
 }
 
 /// `Ok(None)` is a wrong password; `Err` is anything else.
-fn unwrap(key: &VaultKeyRow, password: &str) -> Result<Option<Zeroizing<[u8; 32]>>> {
+/// Re-encrypts every item from one data key to another, keeping each uid and
+/// so each item's AAD. Used when a device joins a sync account with a vault of
+/// its own.
+pub(crate) fn reseal_items(store: &Store, from: &[u8; 32], to: &[u8; 32]) -> Result<usize> {
+    let items = store.vault_items()?;
+    for row in &items {
+        let (uid, secret) = store
+            .vault_secret(row.id)?
+            .ok_or_else(|| anyhow!("vault entry {} vanished", row.id))?;
+        let label = open(from, &row.label, &item_aad(&uid, "label"))
+            .ok_or_else(|| anyhow!("vault entry {} failed to decrypt", row.id))?;
+        let secret = open(from, &secret, &item_aad(&uid, "secret"))
+            .ok_or_else(|| anyhow!("vault entry {} failed to decrypt", row.id))?;
+        store.reseal_vault_item(
+            &uid,
+            &seal(to, &label, &item_aad(&uid, "label"))?,
+            &seal(to, &secret, &item_aad(&uid, "secret"))?,
+        )?;
+    }
+    Ok(items.len())
+}
+
+pub(crate) fn unwrap(key: &VaultKeyRow, password: &str) -> Result<Option<Zeroizing<[u8; 32]>>> {
     let kek = kdf(password, &key.salt, KdfParams::of(key).checked()?)?;
     let Some(plain) = open(&kek, &key.wrapped_dek, AAD_DEK) else {
         return Ok(None);

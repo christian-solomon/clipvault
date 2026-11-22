@@ -39,7 +39,7 @@ pub enum Sensitivity {
 }
 
 impl Sensitivity {
-    fn from_db(v: i64) -> Self {
+    pub fn from_db(v: i64) -> Self {
         match v {
             1 => Sensitivity::Flagged,
             2 => Sensitivity::Kept,
@@ -47,7 +47,7 @@ impl Sensitivity {
         }
     }
 
-    fn to_db(self) -> i64 {
+    pub fn to_db(self) -> i64 {
         match self {
             Sensitivity::None => 0,
             Sensitivity::Flagged => 1,
@@ -964,6 +964,291 @@ impl Store {
     }
 }
 
+/// A history row as the sync engine uploads it.
+pub struct LocalClip {
+    pub id: i64,
+    pub fp: Option<String>,
+    pub kind: String,
+    /// The identity hash dedupe uses: SHA-256 of the text, or of the pixels.
+    pub hash: String,
+    pub content: String,
+    pub blob: Option<Vec<u8>>,
+    pub thumb: Option<Vec<u8>>,
+    pub preview: String,
+    pub truncated: bool,
+    pub bytes: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub pinned: bool,
+    pub created_at: i64,
+    pub last_used_at: i64,
+    pub use_count: i64,
+    pub sensitivity: Sensitivity,
+    pub updated_at: i64,
+}
+
+/// The fields of a synced clip that change after it is first copied.
+pub struct ClipState {
+    pub pinned: bool,
+    pub last_used_at: i64,
+    pub use_count: i64,
+    pub sensitivity: Sensitivity,
+    pub updated_at: i64,
+}
+
+/// A vault row as the sync engine uploads it; the ciphertext travels as is.
+pub struct LocalVaultItem {
+    pub uid: Vec<u8>,
+    pub label: Sealed,
+    pub secret: Sealed,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tombstone {
+    pub kind: String,
+    pub id: String,
+    pub updated_at: i64,
+}
+
+/// Reads and writes for the sync engine. Applying a remote change never marks
+/// anything dirty or leaves a tombstone: it came from elsewhere already.
+impl Store {
+    pub fn dirty_clips(&self, limit: i64) -> Result<Vec<LocalClip>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT id, fp, kind, hash, content, blob, thumb, preview, truncated, bytes,
+                        width, height, pinned, created_at, last_used_at, use_count, sensitive,
+                        updated_at
+                 FROM entries WHERE dirty = 1 ORDER BY updated_at LIMIT ?1",
+            )?
+            .query_map(params![limit], |r| {
+                Ok(LocalClip {
+                    id: r.get(0)?,
+                    fp: r.get(1)?,
+                    kind: r.get(2)?,
+                    hash: r.get(3)?,
+                    content: r.get(4)?,
+                    blob: r.get(5)?,
+                    thumb: r.get(6)?,
+                    preview: r.get(7)?,
+                    truncated: r.get::<_, i64>(8)? != 0,
+                    bytes: r.get(9)?,
+                    width: r.get(10)?,
+                    height: r.get(11)?,
+                    pinned: r.get::<_, i64>(12)? != 0,
+                    created_at: r.get(13)?,
+                    last_used_at: r.get(14)?,
+                    use_count: r.get(15)?,
+                    sensitivity: Sensitivity::from_db(r.get(16)?),
+                    updated_at: r.get(17)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn set_fp(&self, id: i64, fp: &str) -> Result<()> {
+        self.conn.execute("UPDATE entries SET fp = ?1 WHERE id = ?2", params![fp, id])?;
+        Ok(())
+    }
+
+    /// Clears the flag unless the row changed again since it was read.
+    pub fn mark_clip_clean(&self, id: i64, updated_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET dirty = 0 WHERE id = ?1 AND updated_at = ?2",
+            params![id, updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// The local row a fingerprint names, with its last change time.
+    pub fn clip_by_fp(&self, fp: &str) -> Result<Option<(i64, i64)>> {
+        Ok(self
+            .conn
+            .query_row("SELECT id, updated_at FROM entries WHERE fp = ?1", params![fp], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+    }
+
+    /// A row with the same content recorded here before it had a fingerprint.
+    pub fn clip_by_hash(&self, hash: &str) -> Result<Option<(i64, Option<String>, i64)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, fp, updated_at FROM entries WHERE hash = ?1",
+                params![hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Inserts a clip another device copied. Returns the new row id.
+    pub fn insert_remote_clip(
+        &self,
+        fp: &str,
+        clip: &Clip,
+        state: &ClipState,
+        created_at: i64,
+        origin: Option<&str>,
+    ) -> Result<i64> {
+        let id = self
+            .record(clip)?
+            .ok_or_else(|| anyhow::anyhow!("remote clip {fp} has nothing in it"))?;
+        self.conn.execute(
+            "UPDATE entries SET fp = ?1, created_at = ?2, origin = ?3 WHERE id = ?4",
+            params![fp, created_at, origin, id],
+        )?;
+        self.apply_clip_state(id, state)?;
+        Ok(id)
+    }
+
+    /// Takes the remote side's pinned, last-used and flag state.
+    pub fn apply_clip_state(&self, id: i64, state: &ClipState) -> Result<()> {
+        self.conn.execute(
+            "UPDATE entries SET pinned = ?1, last_used_at = ?2, use_count = ?3, sensitive = ?4,
+                    updated_at = ?5, dirty = 0
+             WHERE id = ?6",
+            params![
+                state.pinned as i64,
+                state.last_used_at,
+                state.use_count,
+                state.sensitivity.to_db(),
+                state.updated_at,
+                id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a clip another device deleted, without a tombstone of its own.
+    pub fn delete_remote_clip(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+        self.scrub()
+    }
+
+    /// Applies the history limits, e.g. after pulling another device's copies.
+    pub fn enforce_limits(&self) -> Result<()> {
+        self.trim()
+    }
+
+    pub fn dirty_vault_items(&self) -> Result<Vec<LocalVaultItem>> {
+        let rows = self
+            .conn
+            .prepare(
+                "SELECT uid, label_nonce, label_ct, secret_nonce, secret_ct, created_at, updated_at
+                 FROM vault_items WHERE dirty = 1 ORDER BY updated_at",
+            )?
+            .query_map([], |r| {
+                Ok(LocalVaultItem {
+                    uid: r.get(0)?,
+                    label: Sealed { nonce: r.get(1)?, ct: r.get(2)? },
+                    secret: Sealed { nonce: r.get(3)?, ct: r.get(4)? },
+                    created_at: r.get(5)?,
+                    updated_at: r.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn mark_vault_item_clean(&self, uid: &[u8], updated_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE vault_items SET dirty = 0 WHERE uid = ?1 AND updated_at = ?2",
+            params![uid, updated_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn vault_item_updated_at(&self, uid: &[u8]) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT updated_at FROM vault_items WHERE uid = ?1", params![uid], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    pub fn upsert_remote_vault_item(&self, item: &LocalVaultItem) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO vault_items
+               (uid, label_nonce, label_ct, secret_nonce, secret_ct, created_at, updated_at, dirty)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+             ON CONFLICT (uid) DO UPDATE SET
+               label_nonce = excluded.label_nonce, label_ct = excluded.label_ct,
+               secret_nonce = excluded.secret_nonce, secret_ct = excluded.secret_ct,
+               updated_at = excluded.updated_at, dirty = 0",
+            params![
+                item.uid,
+                item.label.nonce,
+                item.label.ct,
+                item.secret.nonce,
+                item.secret.ct,
+                item.created_at,
+                item.updated_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces an item's ciphertexts after a key change; it then needs upload.
+    pub fn reseal_vault_item(&self, uid: &[u8], label: &Sealed, secret: &Sealed) -> Result<()> {
+        self.conn.execute(
+            "UPDATE vault_items SET label_nonce = ?1, label_ct = ?2, secret_nonce = ?3,
+                    secret_ct = ?4, updated_at = ?5, dirty = 1
+             WHERE uid = ?6",
+            params![label.nonce, label.ct, secret.nonce, secret.ct, now_ms(), uid],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_remote_vault_item(&self, uid: &[u8]) -> Result<()> {
+        self.conn.execute("DELETE FROM vault_items WHERE uid = ?1", params![uid])?;
+        self.scrub()
+    }
+
+    pub fn tombstones(&self) -> Result<Vec<Tombstone>> {
+        let rows = self
+            .conn
+            .prepare("SELECT kind, id, updated_at FROM tombstones ORDER BY updated_at")?
+            .query_map([], |r| {
+                Ok(Tombstone { kind: r.get(0)?, id: r.get(1)?, updated_at: r.get(2)? })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn drop_tombstone(&self, t: &Tombstone) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM tombstones WHERE kind = ?1 AND id = ?2 AND updated_at = ?3",
+            params![t.kind, t.id, t.updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// When this device changed the account and has not uploaded it yet.
+    pub fn account_change(&self) -> Result<Option<(AccountKeys, i64, bool)>> {
+        let Some(keys) = self.account()? else { return Ok(None) };
+        let (updated_at, dirty): (i64, i64) = self.conn.query_row(
+            "SELECT updated_at, dirty FROM vault_key WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(Some((keys, updated_at, dirty != 0)))
+    }
+
+    pub fn mark_account_clean(&self, updated_at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE vault_key SET dirty = 0 WHERE id = 1 AND updated_at = ?1",
+            params![updated_at],
+        )?;
+        Ok(())
+    }
+}
+
 fn add_missing_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
     let existing: Vec<String> = conn
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
@@ -1644,10 +1929,12 @@ pub mod tempdir {
     impl Dir {
         #[allow(clippy::new_without_default)]
         pub fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let p = std::env::temp_dir().join(format!(
-                "clipvault-test-{}-{:?}",
+                "clipvault-test-{}-{:?}-{}",
                 std::process::id(),
-                std::thread::current().id()
+                std::thread::current().id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             let _ = std::fs::remove_dir_all(&p);
             std::fs::create_dir_all(&p).unwrap();
