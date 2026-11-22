@@ -14,6 +14,7 @@ use gpui_component::{
 use gpui_kit_assets::IconName as AssetIcon;
 use zeroize::Zeroizing;
 
+use clipvault_core::sync::SyncStatus;
 use clipvault_core::vault::Status;
 
 use crate::app::{AppState, Badge, Preview, RowId, Tab};
@@ -597,9 +598,114 @@ impl Palette {
         });
     }
 
-    /// Unlock, or create the vault. The password is read once into a
-    /// self-wiping string and the fields are emptied straight away; the KDF
-    /// runs in the background.
+    /// Sets up sync on the first device, or unlocks it on another. The
+    /// password goes to the sync engine; the fields are emptied at once.
+    fn open_sync_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let setup = self.state.read(cx).sync_status == Some(SyncStatus::NeedsSetup);
+        let make = |placeholder: &'static str, window: &mut Window, cx: &mut Context<Self>| {
+            cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder))
+        };
+        let password = make("Master password", window, cx);
+        let again = make("Master password again", window, cx);
+        let state = self.state.clone();
+        let first = focus_once();
+        window.open_alert_dialog(cx, move |alert, window, cx| {
+            first(&password, window, cx);
+            let (state, password, again) = (state.clone(), password.clone(), again.clone());
+            let explain = if setup {
+                "Choose the master password every device will use, for sync and the vault. \
+                 If this computer already has a vault, use its password."
+            } else {
+                "Enter the master password set on your other device. This device then \
+                 keeps a key in your keyring and will not ask again."
+            };
+            alert
+                .confirm()
+                .title(theme::heading(if setup { "Turn on sync" } else { "Unlock sync" }))
+                .description(
+                    v_flex()
+                        .gap_2()
+                        .child(explain)
+                        .child(Input::new(&password).tab_index(0))
+                        .when(setup, |d| d.child(Input::new(&again).tab_index(1))),
+                )
+                .ok_text(if setup { "Turn on sync" } else { "Unlock" })
+                .on_ok(move |_, window, cx| {
+                    let fields: &[&Entity<InputState>] =
+                        if setup { &[&password, &again] } else { &[&password] };
+                    if !all_filled(fields, window, cx) {
+                        return false;
+                    }
+                    let pw = Zeroizing::new(password.read(cx).value().to_string());
+                    let pw2 = Zeroizing::new(again.read(cx).value().to_string());
+                    for input in [&password, &again] {
+                        input.update(cx, |s, cx| s.set_value("", window, cx));
+                    }
+                    if setup && *pw != *pw2 {
+                        window.push_notification("The passwords do not match", cx);
+                        return false;
+                    }
+                    state.update(cx, |s, cx| {
+                        if setup {
+                            s.sync_setup(pw, cx)
+                        } else {
+                            s.sync_unlock(pw, cx)
+                        }
+                    });
+                    true
+                })
+        });
+    }
+
+    /// A dot and a word for the sync state; when sync needs the password,
+    /// clicking it asks.
+    fn render_sync_chip(&self, status: SyncStatus, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (label, color, tip): (&str, Hsla, SharedString) = match &status {
+            SyncStatus::Connecting => {
+                ("Connecting", theme.muted_foreground, "Reaching the sync database".into())
+            }
+            SyncStatus::NeedsSetup => {
+                ("Set up sync", theme.warning, "Choose the master password for sync".into())
+            }
+            SyncStatus::NeedsUnlock => (
+                "Unlock sync",
+                theme.warning,
+                "Enter the master password once on this device".into(),
+            ),
+            SyncStatus::Syncing => ("Syncing", theme.info, "Exchanging changes".into()),
+            SyncStatus::Synced { at_ms } => (
+                "Synced",
+                theme.success,
+                format!("Last synced {}", crate::app::ago(at_ms / 1000)).into(),
+            ),
+            SyncStatus::Offline { reason } => ("Offline", theme.danger, reason.clone().into()),
+        };
+        let asks = matches!(status, SyncStatus::NeedsSetup | SyncStatus::NeedsUnlock);
+        h_flex()
+            .id("sync-chip")
+            .gap_1p5()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .text_xs()
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if asks { theme.foreground } else { theme.muted_foreground })
+            .when(asks, |d| {
+                d.cursor_pointer()
+                    .bg(theme.warning.opacity(0.12))
+                    .hover(|d| d.bg(theme.warning.opacity(0.2)))
+            })
+            .child(div().size(px(7.)).rounded_full().bg(color))
+            .child(label)
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            })
+            .when(asks, |d| {
+                d.on_click(cx.listener(|this, _, window, cx| this.open_sync_dialog(window, cx)))
+            })
+    }
+
     fn ask_clear_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (loose, pinned) = self.state.read(cx).history_counts();
         if loose + pinned == 0 {
@@ -696,6 +802,9 @@ impl Palette {
         });
     }
 
+    /// Unlock, or create the vault. The password is read once into a
+    /// self-wiping string and the fields are emptied straight away; the KDF
+    /// runs in the background.
     fn submit_gate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (creating, busy) = {
             let s = self.state.read(cx);
@@ -735,6 +844,12 @@ impl Palette {
     // ---- rendering ----------------------------------------------------------
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chip = self
+            .state
+            .read(cx)
+            .sync_status
+            .clone()
+            .map(|status| self.render_sync_chip(status, cx).into_any_element());
         let theme = cx.theme();
         let tab = self.tab(cx);
         let dark = theme.mode.is_dark();
@@ -779,6 +894,7 @@ impl Palette {
                     })
                     .when(tab == Tab::Vault, |d| d.child(theme::heading("Vault").text_sm())),
             )
+            .children(chip)
             .when(tab == Tab::History, |d| {
                 d.child(
                     Button::new("clear-history")

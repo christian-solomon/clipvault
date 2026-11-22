@@ -167,6 +167,36 @@ fn run(args: &[String]) -> Result<()> {
     locker::spawn(tx.clone());
     appearance::spawn(tx.clone());
 
+    // Sync runs only when a database is configured; otherwise all stays local.
+    let sync = match &cfg.sync {
+        None => None,
+        Some(settings) => {
+            log::info!("sync: {} as {:?}", settings.redacted_url(), settings.device_name);
+            let tx = tx.clone();
+            let engine = clipvault_core::sync::spawn(
+                clipvault_core::sync::SyncConfig {
+                    url: settings.url.clone(),
+                    database: settings.database.clone(),
+                    device_name: settings.device_name.clone(),
+                    db_path: cfg.db_path(),
+                    limits: (cfg.history_max_entries, cfg.history_max_bytes),
+                    adopt: settings.adopt,
+                },
+                Box::new(clipvault_core::account::OsKeyring),
+                move |ev| {
+                    let _ = tx.send_blocking(AppEvent::Sync(ev));
+                },
+            );
+            match engine {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    log::error!("sync will not run: {e:#}");
+                    None
+                }
+            }
+        }
+    };
+
     let clipboard = match ClipboardWriter::new(guard) {
         Ok(c) => Some(c),
         Err(e) => {
@@ -182,7 +212,8 @@ fn run(args: &[String]) -> Result<()> {
             gpui_component::init(cx);
             theme::init(cx);
             ui::bind_keys(cx);
-            let state = cx.new(|cx| AppState::new(cfg, store, ephemeral, clipboard, dark, cx));
+            let state =
+                cx.new(|cx| AppState::new(cfg, store, ephemeral, clipboard, dark, sync, cx));
             let st = state.clone();
             cx.spawn(async move |cx| {
                 while let Ok(event) = rx.recv().await {

@@ -73,6 +73,8 @@ pub struct Entry {
     /// Only rows kept on purpose, or recorded before detection existed, can
     /// be anything but `None`: new credentials never reach disk.
     pub sensitivity: Sensitivity,
+    /// The device a synced entry was first copied on; `None` for this one.
+    pub origin: Option<String>,
 }
 
 /// Something worth remembering off the clipboard.
@@ -564,7 +566,7 @@ impl Store {
         let (sql, like) = if q.is_empty() {
             (
                 "SELECT id, kind, preview, truncated, bytes, pinned, created_at, last_used_at,
-                        use_count, width, height, thumb, sensitive
+                        use_count, width, height, thumb, sensitive, origin
                  FROM entries
                  ORDER BY pinned DESC, last_used_at DESC LIMIT ?1"
                     .to_string(),
@@ -573,7 +575,7 @@ impl Store {
         } else {
             (
                 "SELECT id, kind, preview, truncated, bytes, pinned, created_at, last_used_at,
-                        use_count, width, height, thumb, sensitive
+                        use_count, width, height, thumb, sensitive, origin
                  FROM entries
                  WHERE (content LIKE ?2 ESCAPE '\\' OR (kind = 'image' AND preview LIKE ?2 ESCAPE '\\'))
                  ORDER BY pinned DESC, last_used_at DESC LIMIT ?1"
@@ -601,6 +603,7 @@ impl Store {
                 height: r.get(10)?,
                 thumb: r.get(11)?,
                 sensitivity: Sensitivity::from_db(r.get(12)?),
+                origin: r.get(13)?,
             })
         };
         let rows = match like {

@@ -13,12 +13,14 @@ use gpui::*;
 use gpui_component::{Root, WindowExt};
 use zeroize::Zeroizing;
 
+use clipvault_core::account::OsKeyring;
 use clipvault_core::clipboard::ClipboardWriter;
 use clipvault_core::config::Config;
 use clipvault_core::ephemeral::Ephemeral;
 use clipvault_core::media::human_size;
 use clipvault_core::recorder::Recorded;
 use clipvault_core::store::{now, Sensitivity, Store};
+use clipvault_core::sync::{SyncEvent, SyncHandle, SyncStatus};
 use clipvault_core::vault::{Status, Vault, VaultItem};
 
 use crate::ui::Palette;
@@ -31,6 +33,7 @@ pub enum AppEvent {
     Recorded(Recorded),
     /// The desktop switched colour scheme; `true` is dark.
     Appearance(bool),
+    Sync(SyncEvent),
     Quit,
 }
 
@@ -96,6 +99,11 @@ pub struct AppState {
     clipboard: Option<ClipboardWriter>,
     /// The desktop's colour scheme; `None` leaves it to GPUI.
     pub dark: Option<bool>,
+    /// The sync engine, when `CLIPVAULT_MONGODB_URL` is set.
+    sync: Option<SyncHandle>,
+    pub sync_status: Option<SyncStatus>,
+    /// Why the last set-up or unlock attempt failed.
+    pub sync_error: Option<SharedString>,
 
     pub window: Option<WindowHandle<Root>>,
     /// Where the window last was, so it reopens there. Kept for this run only.
@@ -131,6 +139,7 @@ impl AppState {
         ephemeral: Arc<Mutex<Ephemeral>>,
         clipboard: Option<ClipboardWriter>,
         dark: Option<bool>,
+        sync: Option<SyncHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
         // One timer drives expiry, auto-lock and the visible countdowns.
@@ -148,6 +157,9 @@ impl AppState {
             busy: false,
             clipboard,
             dark,
+            sync_status: sync.as_ref().map(|_| SyncStatus::Connecting),
+            sync,
+            sync_error: None,
             window: None,
             last_origin: None,
             tab: Tab::History,
@@ -272,6 +284,9 @@ impl AppState {
             let mut meta = format!("{} · {}", human_size(e.bytes as usize), ago(e.last_used_at));
             if e.use_count > 0 {
                 meta.push_str(&format!(" · used {}×", e.use_count + 1));
+            }
+            if let Some(from) = &e.origin {
+                meta.push_str(&format!(" · from {from}"));
             }
             rows.push(Row {
                 id: RowId::Entry(e.id),
@@ -428,9 +443,86 @@ impl AppState {
                     clipboard.copy_text(&text)?;
                 }
                 store.mark_used(id)?;
+                drop(store);
+                self.nudge_sync();
             }
         }
         Ok(())
+    }
+
+    /// Tells the sync engine a local change is waiting to go up.
+    pub fn nudge_sync(&self) {
+        if let Some(sync) = &self.sync {
+            sync.changed();
+        }
+    }
+
+    pub fn sync_setup(&mut self, password: Zeroizing<String>, cx: &mut Context<Self>) {
+        self.sync_error = None;
+        if let Some(sync) = &self.sync {
+            sync.setup(password);
+        }
+        cx.notify();
+    }
+
+    fn on_sync_event(&mut self, event: SyncEvent, cx: &mut Context<Self>) {
+        match event {
+            SyncEvent::Status(status) => {
+                if matches!(status, SyncStatus::Synced { .. }) {
+                    self.sync_error = None;
+                }
+                // Each round reports Syncing; once synced, only the result
+                // is worth showing.
+                let routine = status == SyncStatus::Syncing
+                    && matches!(self.sync_status, Some(SyncStatus::Synced { .. }));
+                if !routine {
+                    self.sync_status = Some(status);
+                }
+            }
+            SyncEvent::Changed => {
+                if self.window.is_some() {
+                    self.refresh(cx);
+                }
+                self.refresh_vault();
+            }
+            SyncEvent::Rejected(reason) => {
+                self.toast(cx, reason.clone());
+                self.sync_error = Some(reason.into());
+            }
+            // Another device's copy goes on this clipboard. The echo guard
+            // keeps the watcher from recording it as a new copy here.
+            SyncEvent::AdoptText { text, from } => {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    match cb.copy_text(&text) {
+                        Ok(()) => self.announce_adopted(from, cx),
+                        Err(e) => log::warn!("could not take a synced copy: {e:#}"),
+                    }
+                }
+            }
+            SyncEvent::AdoptImage { png, from } => {
+                if let Some(cb) = self.clipboard.as_mut() {
+                    match cb.copy_image(&png) {
+                        Ok(()) => self.announce_adopted(from, cx),
+                        Err(e) => log::warn!("could not take a synced image: {e:#}"),
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn announce_adopted(&self, from: Option<String>, cx: &mut Context<Self>) {
+        let from = from.unwrap_or_else(|| "another device".into());
+        log::info!("copied a clip from {from}");
+        self.toast(cx, format!("Copied from {from}"));
+    }
+
+    pub fn sync_unlock(&mut self, password: Zeroizing<String>, cx: &mut Context<Self>) {
+        self.sync_error = None;
+        if let Some(sync) = &self.sync {
+            sync.unlock(password);
+        }
+        cx.notify();
     }
 
     pub fn toggle_pin(&mut self, cx: &mut Context<Self>) -> Result<()> {
@@ -439,6 +531,7 @@ impl AppState {
         };
         if let RowId::Entry(id) = row.id {
             self.store.lock().unwrap().set_pinned(id, !row.pinned)?;
+            self.nudge_sync();
             self.refresh(cx);
         }
         Ok(())
@@ -453,6 +546,7 @@ impl AppState {
             .remove(id)
             .ok_or_else(|| anyhow!("that clip has expired"))?;
         self.store.lock().unwrap().keep_sensitive(&text)?;
+        self.nudge_sync();
         self.refresh(cx);
         Ok(())
     }
@@ -464,6 +558,7 @@ impl AppState {
                 self.ephemeral.lock().unwrap().remove(id);
             }
         }
+        self.nudge_sync();
         self.refresh(cx);
         Ok(())
     }
@@ -503,13 +598,17 @@ impl AppState {
                     Ok(n)
                 })
                 .await;
-            this.update(cx, |s, cx| s.refresh(cx))?;
+            this.update(cx, |s, cx| {
+                s.nudge_sync();
+                s.refresh(cx)
+            })?;
             result.map(|n| n + memory)
         })
     }
 
     pub fn delete_flagged(&mut self, cx: &mut Context<Self>) -> Result<usize> {
         let n = self.store.lock().unwrap().delete_flagged()?;
+        self.nudge_sync();
         self.refresh(cx);
         Ok(n)
     }
@@ -555,6 +654,7 @@ impl AppState {
             }
         }
         drop(store);
+        self.nudge_sync();
         self.refresh(cx);
         self.refresh_vault();
         Ok(())
@@ -612,6 +712,9 @@ impl AppState {
                     let mut vault = vault.lock().unwrap();
                     match confirm {
                         Some(again) if *again != *password => bail!("the passwords do not match"),
+                        Some(_) if store.vault_was_reset()? => {
+                            vault.init_synced(&store, &password, &OsKeyring)
+                        }
                         Some(_) => vault.init(&store, &password),
                         None => vault.unlock(&store, &password),
                     }
@@ -620,6 +723,7 @@ impl AppState {
             this.update(cx, |s, cx| {
                 s.busy = false;
                 s.refresh_vault();
+                s.nudge_sync();
                 cx.notify();
             })?;
             result
@@ -644,6 +748,7 @@ impl AppState {
             this.update(cx, |s, cx| {
                 s.busy = false;
                 s.refresh_vault();
+                s.nudge_sync();
                 cx.notify();
             })?;
             result
@@ -726,6 +831,7 @@ impl AppState {
         let store = self.store.lock().unwrap();
         self.vault.lock().unwrap().add(&store, label, secret)?;
         drop(store);
+        self.nudge_sync();
         self.refresh_vault();
         cx.notify();
         Ok(())
@@ -735,6 +841,7 @@ impl AppState {
         let store = self.store.lock().unwrap();
         self.vault.lock().unwrap().delete(&store, id)?;
         drop(store);
+        self.nudge_sync();
         self.revealed = None;
         self.refresh_vault();
         cx.notify();
@@ -765,6 +872,7 @@ impl AppState {
                 .await;
             this.update(cx, |s, cx| {
                 s.busy = false;
+                s.nudge_sync();
                 cx.notify();
             })?;
             result
@@ -902,6 +1010,9 @@ pub fn handle_event(state: &Entity<AppState>, event: AppEvent, cx: &mut App) {
             }
         }),
         AppEvent::Recorded(recorded) => state.update(cx, |s, cx| {
+            if matches!(recorded, Recorded::History(_)) {
+                s.nudge_sync();
+            }
             if s.window.is_some() {
                 s.refresh(cx);
                 if let Recorded::Sensitive(id) = recorded {
@@ -911,6 +1022,7 @@ pub fn handle_event(state: &Entity<AppState>, event: AppEvent, cx: &mut App) {
                 }
             }
         }),
+        AppEvent::Sync(event) => state.update(cx, |s, cx| s.on_sync_event(event, cx)),
         AppEvent::Appearance(dark) => {
             state.update(cx, |s, _| s.dark = Some(dark));
             if let Some(h) = state.read(cx).window {
