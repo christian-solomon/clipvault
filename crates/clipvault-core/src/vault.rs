@@ -11,97 +11,24 @@
 //! instead of quietly handing back the wrong secret under a trusted label.
 
 use anyhow::{anyhow, bail, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rand::RngCore;
 use std::time::{Duration, Instant};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-use crate::store::{now, LegacyVault, NewSealedItem, Sealed, Store, VaultKeyRow};
+use crate::crypto::{into_string, kdf, open, random, seal, KdfParams, SALT_LEN};
+use crate::store::{now, LegacyVault, NewSealedItem, Store, VaultKeyRow};
 
-const SALT_LEN: usize = 16;
 const UID_LEN: usize = 16;
-const NONCE_LEN: usize = 24;
 const MIN_PASSWORD_CHARS: usize = 8;
 const MAX_LABEL_CHARS: usize = 200;
 const MAX_SECRET_BYTES: usize = 64 * 1024;
 
 /// Plaintext sealed under the first-generation key to check the password.
 const LEGACY_VERIFIER: &[u8] = b"clipvault-verify-v1";
-const AAD_DEK: &[u8] = b"clipvault/v2/dek";
+pub(crate) const AAD_DEK: &[u8] = b"clipvault/v2/dek";
 
 /// After this many wrong passwords in a row, each further attempt waits.
 const FREE_ATTEMPTS: u32 = 3;
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-/// argon2id cost. ~64 MiB and 3 passes is roughly a quarter second on a
-/// laptop: cheap once per unlock, expensive a few billion times offline.
-/// Stored with the vault so it can be raised later without locking anyone out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct KdfParams {
-    mem_kib: u32,
-    passes: u32,
-    lanes: u32,
-}
-
-impl KdfParams {
-    const CURRENT: KdfParams = KdfParams { mem_kib: 65536, passes: 3, lanes: 4 };
-    /// What the first-generation vault used, before parameters were stored.
-    const LEGACY: KdfParams = KdfParams { mem_kib: 65536, passes: 3, lanes: 4 };
-
-    fn of(row: &VaultKeyRow) -> Self {
-        KdfParams { mem_kib: row.kdf_mem_kib, passes: row.kdf_passes, lanes: row.kdf_lanes }
-    }
-
-    /// Bounds the stored values, so an edited database cannot make an unlock
-    /// allocate gigabytes or spin for minutes, nor drop the cost to nothing.
-    fn checked(self) -> Result<Self> {
-        let ok = (8 * 1024..=1024 * 1024).contains(&self.mem_kib)
-            && (1..=16).contains(&self.passes)
-            && (1..=16).contains(&self.lanes);
-        if !ok {
-            bail!(
-                "vault key parameters are out of range; the database may have been tampered with"
-            );
-        }
-        Ok(self)
-    }
-}
-
-fn kdf(password: &str, salt: &[u8], p: KdfParams) -> Result<Zeroizing<[u8; 32]>> {
-    let params = Params::new(p.mem_kib, p.passes, p.lanes, Some(32))
-        .map_err(|e| anyhow!("argon2 params: {e}"))?;
-    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut out = Zeroizing::new([0u8; 32]);
-    argon
-        .hash_password_into(password.as_bytes(), salt, out.as_mut())
-        .map_err(|e| anyhow!("argon2: {e}"))?;
-    Ok(out)
-}
-
-fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
-    XChaCha20Poly1305::new(Key::from_slice(key))
-}
-
-fn seal(key: &[u8; 32], msg: &[u8], aad: &[u8]) -> Result<Sealed> {
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let ct = cipher(key)
-        .encrypt(&nonce, Payload { msg, aad })
-        .map_err(|_| anyhow!("encryption failed"))?;
-    Ok(Sealed { nonce: nonce.to_vec(), ct })
-}
-
-/// `None` means the tag did not verify: wrong key, wrong AAD, or tampering.
-fn open(key: &[u8; 32], sealed: &Sealed, aad: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-    if sealed.nonce.len() != NONCE_LEN {
-        return None;
-    }
-    cipher(key)
-        .decrypt(XNonce::from_slice(&sealed.nonce), Payload { msg: &sealed.ct, aad })
-        .ok()
-        .map(Zeroizing::new)
-}
 
 fn item_aad(uid: &[u8], field: &str) -> Vec<u8> {
     let mut aad = b"clipvault/v2/".to_vec();
@@ -111,23 +38,6 @@ fn item_aad(uid: &[u8], field: &str) -> Vec<u8> {
     aad.push(b'/');
     aad.extend_from_slice(field.as_bytes());
     aad
-}
-
-fn random<const N: usize>() -> [u8; N] {
-    let mut out = [0u8; N];
-    OsRng.fill_bytes(&mut out);
-    out
-}
-
-/// Moves decrypted bytes into a self-wiping String without another copy.
-fn into_string(mut bytes: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>> {
-    match String::from_utf8(std::mem::take(&mut *bytes)) {
-        Ok(s) => Ok(Zeroizing::new(s)),
-        Err(e) => {
-            e.into_bytes().zeroize();
-            bail!("stored value is not valid UTF-8")
-        }
-    }
 }
 
 fn check_password(password: &str) -> Result<()> {
@@ -200,6 +110,11 @@ impl Vault {
 
     pub fn is_unlocked(&self) -> bool {
         self.dek.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dek_for_tests(&self) -> [u8; 32] {
+        **self.dek.as_ref().expect("unlocked")
     }
 
     pub fn lock(&mut self) {
