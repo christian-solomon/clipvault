@@ -1,7 +1,8 @@
+use crate::account::AccountKeys;
 use crate::harden;
 use crate::media::{human_size, ImageClip};
 use anyhow::{bail, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, ToSql};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,7 +26,7 @@ const PREVIEW_CHARS: usize = 220;
 ///   password.
 /// - 3: rows recorded before secret detection existed are scanned once, and
 ///   matches are flagged for review.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Whether an entry looks like a credential, and whether anyone decided so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -146,6 +147,11 @@ pub fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// Milliseconds since the epoch: the clock sync orders changes by.
+pub fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
 pub fn hash_of(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(text.as_bytes());
@@ -220,6 +226,9 @@ impl Store {
         }
         if version < 3 {
             self.migrate_v3()?;
+        }
+        if version < 4 {
+            self.migrate_v4()?;
         }
         Ok(())
     }
@@ -358,6 +367,64 @@ impl Store {
         Ok(())
     }
 
+    /// Change tracking for sync. Every row starts dirty, so the first sync
+    /// uploads what is already here; deletes of synced rows leave tombstones.
+    /// Columns are added only where missing, so a rerun is harmless.
+    fn migrate_v4(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        add_missing_columns(
+            &tx,
+            "entries",
+            &[
+                ("fp", "TEXT"),
+                ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("dirty", "INTEGER NOT NULL DEFAULT 1"),
+                ("origin", "TEXT"),
+            ],
+        )?;
+        add_missing_columns(
+            &tx,
+            "vault_items",
+            &[
+                ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("dirty", "INTEGER NOT NULL DEFAULT 1"),
+            ],
+        )?;
+        add_missing_columns(
+            &tx,
+            "vault_key",
+            &[
+                ("account_id", "BLOB"),
+                ("hist_nonce", "BLOB"),
+                ("hist_ct", "BLOB"),
+                ("hist_check", "BLOB"),
+                ("updated_at", "INTEGER NOT NULL DEFAULT 0"),
+                ("dirty", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )?;
+        tx.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_fp ON entries (fp) WHERE fp IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_entries_dirty ON entries (dirty) WHERE dirty = 1;
+            UPDATE entries SET updated_at = last_used_at * 1000 WHERE updated_at = 0;
+            UPDATE vault_items SET updated_at = created_at * 1000 WHERE updated_at = 0;
+            CREATE TABLE IF NOT EXISTS tombstones (
+                kind       TEXT    NOT NULL,
+                id         TEXT    NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (kind, id)
+            );
+            CREATE TABLE IF NOT EXISTS sync_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            "#,
+        )?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Folds the WAL back into the database and truncates it, so content
     /// removed by a delete does not linger in old WAL frames.
     pub fn scrub(&self) -> Result<()> {
@@ -395,8 +462,10 @@ impl Store {
 
         if let Some(id) = existing {
             self.conn.execute(
-                "UPDATE entries SET last_used_at = ?1, use_count = use_count + 1 WHERE id = ?2",
-                params![ts, id],
+                "UPDATE entries SET last_used_at = ?1, use_count = use_count + 1,
+                        dirty = 1, updated_at = ?2
+                 WHERE id = ?3",
+                params![ts, now_ms(), id],
             )?;
             return Ok(Some(id));
         }
@@ -406,9 +475,10 @@ impl Store {
                 let (preview, truncated) = preview_of(text);
                 self.conn.execute(
                     "INSERT INTO entries
-                       (kind, content, hash, preview, truncated, bytes, created_at, last_used_at)
-                     VALUES ('text', ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
-                    params![text, hash, preview, truncated as i64, text.len() as i64, ts],
+                       (kind, content, hash, preview, truncated, bytes, created_at, last_used_at,
+                        updated_at)
+                     VALUES ('text', ?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)",
+                    params![text, hash, preview, truncated as i64, text.len() as i64, ts, now_ms()],
                 )?;
             }
             Clip::Image(img) => {
@@ -417,8 +487,8 @@ impl Store {
                 self.conn.execute(
                     "INSERT INTO entries
                        (kind, content, hash, preview, truncated, bytes, created_at, last_used_at,
-                        blob, thumb, width, height)
-                     VALUES ('image', '', ?1, ?2, 0, ?3, ?4, ?4, ?5, ?6, ?7, ?8)",
+                        blob, thumb, width, height, updated_at)
+                     VALUES ('image', '', ?1, ?2, 0, ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         hash,
                         preview,
@@ -427,7 +497,8 @@ impl Store {
                         img.png,
                         img.thumb_png,
                         img.width as i64,
-                        img.height as i64
+                        img.height as i64,
+                        now_ms()
                     ],
                 )?;
             }
@@ -443,31 +514,46 @@ impl Store {
     }
 
     fn trim_to(&self, max_unpinned: usize, max_bytes: i64) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM entries WHERE pinned = 0 AND id NOT IN (
+        self.remove_entries(
+            "SELECT id FROM entries WHERE pinned = 0 AND id NOT IN (
                  SELECT id FROM entries WHERE pinned = 0
                  ORDER BY last_used_at DESC LIMIT ?1
              )",
-            params![max_unpinned as i64],
+            &[&(max_unpinned as i64)],
         )?;
 
         // Walk newest to oldest and drop everything past the budget. The sum
         // excludes the row itself, so the most recent entry always survives even
         // if it alone is larger than the budget - having just copied something
         // and finding it already gone would be worse than briefly overshooting.
-        self.conn.execute(
-            "DELETE FROM entries WHERE id IN (
-                 SELECT id FROM (
-                     SELECT id, SUM(bytes) OVER (
-                         ORDER BY last_used_at DESC, id DESC
-                         ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-                     ) AS preceding_bytes
-                     FROM entries WHERE pinned = 0
-                 ) WHERE preceding_bytes >= ?1
-             )",
-            params![max_bytes],
+        self.remove_entries(
+            "SELECT id FROM (
+                 SELECT id, SUM(bytes) OVER (
+                     ORDER BY last_used_at DESC, id DESC
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                 ) AS preceding_bytes
+                 FROM entries WHERE pinned = 0
+             ) WHERE preceding_bytes >= ?1",
+            &[&max_bytes],
         )?;
         Ok(())
+    }
+
+    /// Deletes the entries a subquery selects. Those already synced leave a
+    /// tombstone, so the deletion reaches every device.
+    fn remove_entries(&self, ids: &str, params: &[&dyn ToSql]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO tombstones (kind, id, updated_at)
+                 SELECT 'clip', fp, {} FROM entries WHERE fp IS NOT NULL AND id IN ({ids})",
+                now_ms()
+            ),
+            params,
+        )?;
+        let n = tx.execute(&format!("DELETE FROM entries WHERE id IN ({ids})"), params)?;
+        tx.commit()?;
+        Ok(n)
     }
 
     pub fn list(&self, query: &str, limit: i64) -> Result<Vec<Entry>> {
@@ -552,21 +638,27 @@ impl Store {
 
     pub fn mark_used(&self, id: i64) -> Result<()> {
         self.conn.execute(
-            "UPDATE entries SET last_used_at = ?1, use_count = use_count + 1 WHERE id = ?2",
-            params![now(), id],
+            "UPDATE entries SET last_used_at = ?1, use_count = use_count + 1,
+                    dirty = 1, updated_at = ?2
+             WHERE id = ?3",
+            params![now(), now_ms(), id],
         )?;
         Ok(())
     }
 
     pub fn set_pinned(&self, id: i64, pinned: bool) -> Result<()> {
-        self.conn
-            .execute("UPDATE entries SET pinned = ?1 WHERE id = ?2", params![pinned as i64, id])?;
+        self.conn.execute(
+            "UPDATE entries SET pinned = ?1, dirty = 1, updated_at = ?2 WHERE id = ?3",
+            params![pinned as i64, now_ms(), id],
+        )?;
         Ok(())
     }
 
     pub fn set_sensitivity(&self, id: i64, s: Sensitivity) -> Result<()> {
-        self.conn
-            .execute("UPDATE entries SET sensitive = ?1 WHERE id = ?2", params![s.to_db(), id])?;
+        self.conn.execute(
+            "UPDATE entries SET sensitive = ?1, dirty = 1, updated_at = ?2 WHERE id = ?3",
+            params![s.to_db(), now_ms(), id],
+        )?;
         Ok(())
     }
 
@@ -590,13 +682,13 @@ impl Store {
     }
 
     pub fn delete_flagged(&self) -> Result<usize> {
-        let n = self.conn.execute("DELETE FROM entries WHERE sensitive = 1", [])?;
+        let n = self.remove_entries("SELECT id FROM entries WHERE sensitive = 1", &[])?;
         self.scrub()?;
         Ok(n)
     }
 
     pub fn delete(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+        self.remove_entries("SELECT ?1", &[&id])?;
         self.scrub()
     }
 
@@ -604,9 +696,9 @@ impl Store {
     /// survive unless `include_pinned`; the vault is not history.
     pub fn clear(&self, include_pinned: bool) -> Result<usize> {
         let n = if include_pinned {
-            self.conn.execute("DELETE FROM entries", [])?
+            self.remove_entries("SELECT id FROM entries", &[])?
         } else {
-            self.conn.execute("DELETE FROM entries WHERE pinned = 0", [])?
+            self.remove_entries("SELECT id FROM entries WHERE pinned = 0", &[])?
         };
         self.scrub()?;
         Ok(n)
@@ -649,6 +741,9 @@ impl Store {
     /// Writes the key record. Used on creation and on a password change, which
     /// rewraps the same data key, so no item needs re-encrypting.
     pub fn set_vault_key(&self, key: &VaultKeyRow) -> Result<()> {
+        if self.account()?.is_some() {
+            bail!("the vault key belongs to the sync account; change it through the account");
+        }
         insert_key(&self.conn, key, "INSERT OR REPLACE")?;
         // The old wrapping is as good as the old password; do not keep it.
         self.scrub()
@@ -752,6 +847,11 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         insert_item(&tx, item)?;
         let new_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT OR REPLACE INTO tombstones (kind, id, updated_at)
+             SELECT 'clip', fp, ?2 FROM entries WHERE id = ?1 AND fp IS NOT NULL",
+            params![entry_id, now_ms()],
+        )?;
         let gone = tx.execute("DELETE FROM entries WHERE id = ?1", params![entry_id])?;
         if gone != 1 {
             bail!("entry no longer exists");
@@ -762,7 +862,10 @@ impl Store {
     }
 
     pub fn vault_delete(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM vault_items WHERE id = ?1", params![id])?;
+        let tx = self.conn.unchecked_transaction()?;
+        tombstone_vault_items(&tx, "SELECT ?1", &[&id])?;
+        tx.execute("DELETE FROM vault_items WHERE id = ?1", params![id])?;
+        tx.commit()?;
         self.scrub()
     }
 
@@ -770,6 +873,7 @@ impl Store {
     /// it, the first generation's plaintext labels included, stays on disk.
     pub fn reset_vault(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        tombstone_vault_items(&tx, "SELECT id FROM vault_items", &[])?;
         tx.execute_batch(
             "DELETE FROM vault_items;
              DELETE FROM vault_key;
@@ -779,6 +883,113 @@ impl Store {
         tx.commit()?;
         self.compact()
     }
+
+    // ---- sync bookkeeping ------------------------------------------------
+
+    /// The sync account mirrored in the vault key row, if this device has one.
+    pub fn account(&self) -> Result<Option<AccountKeys>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT account_id, salt, kdf_mem_kib, kdf_passes, kdf_lanes,
+                        dek_nonce, dek_wrapped, hist_nonce, hist_ct, hist_check
+                 FROM vault_key WHERE id = 1 AND account_id IS NOT NULL",
+                [],
+                |r| {
+                    Ok(AccountKeys {
+                        account_id: r.get(0)?,
+                        salt: r.get(1)?,
+                        kdf_mem_kib: r.get(2)?,
+                        kdf_passes: r.get(3)?,
+                        kdf_lanes: r.get(4)?,
+                        vault_dek: Sealed { nonce: r.get(5)?, ct: r.get(6)? },
+                        history_key: Sealed { nonce: r.get(7)?, ct: r.get(8)? },
+                        history_check: r.get(9)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Stores the account as this device's vault key row. `dirty` when the
+    /// change is this device's and still has to reach the other devices.
+    pub fn set_account(&self, keys: &AccountKeys, updated_at: i64, dirty: bool) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO vault_key
+               (id, salt, kdf_mem_kib, kdf_passes, kdf_lanes, dek_nonce, dek_wrapped,
+                account_id, hist_nonce, hist_ct, hist_check, updated_at, dirty)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                keys.salt,
+                keys.kdf_mem_kib,
+                keys.kdf_passes,
+                keys.kdf_lanes,
+                keys.vault_dek.nonce,
+                keys.vault_dek.ct,
+                keys.account_id,
+                keys.history_key.nonce,
+                keys.history_key.ct,
+                keys.history_check,
+                updated_at,
+                dirty as i64
+            ],
+        )?;
+        self.scrub()
+    }
+
+    pub fn sync_value(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM sync_state WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_sync_value(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO sync_state (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// This install's random ID, made on first use. Remote changes carry the
+    /// ID of the device that made them.
+    pub fn device_id(&self) -> Result<String> {
+        if let Some(id) = self.sync_value("device_id")? {
+            return Ok(id);
+        }
+        let id = crate::crypto::hex(&crate::crypto::random::<16>());
+        self.set_sync_value("device_id", &id)?;
+        Ok(id)
+    }
+}
+
+fn add_missing_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+    let existing: Vec<String> = conn
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for (name, decl) in columns {
+        if !existing.iter().any(|c| c == name) {
+            conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {name} {decl}"), [])?;
+        }
+    }
+    Ok(())
+}
+
+fn tombstone_vault_items(conn: &Connection, ids: &str, params: &[&dyn ToSql]) -> Result<()> {
+    let uids: Vec<Vec<u8>> = conn
+        .prepare(&format!("SELECT uid FROM vault_items WHERE id IN ({ids})"))?
+        .query_map(params, |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    let ts = now_ms();
+    for uid in uids {
+        conn.execute(
+            "INSERT OR REPLACE INTO tombstones (kind, id, updated_at) VALUES ('vault', ?1, ?2)",
+            params![crate::crypto::hex(&uid), ts],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_key(conn: &Connection, key: &VaultKeyRow, verb: &str) -> Result<()> {
@@ -803,15 +1014,16 @@ fn insert_key(conn: &Connection, key: &VaultKeyRow, verb: &str) -> Result<()> {
 fn insert_item(conn: &Connection, item: &NewSealedItem) -> Result<()> {
     conn.execute(
         "INSERT INTO vault_items
-           (uid, label_nonce, label_ct, secret_nonce, secret_ct, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+           (uid, label_nonce, label_ct, secret_nonce, secret_ct, created_at, updated_at, dirty)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
         params![
             item.uid,
             item.label.nonce,
             item.label.ct,
             item.secret.nonce,
             item.secret.ct,
-            item.created_at
+            item.created_at,
+            now_ms()
         ],
     )?;
     Ok(())
@@ -1265,6 +1477,160 @@ mod tests {
         assert_eq!(row.preview.chars().count(), PREVIEW_CHARS);
         // The full text is still retrievable even though the preview is cut.
         assert_eq!(s.content(id).unwrap().unwrap().len(), long.len());
+    }
+
+    // ---- sync change tracking -------------------------------------------
+
+    fn dirty(s: &Store, id: i64) -> (bool, i64) {
+        s.conn
+            .query_row("SELECT dirty, updated_at FROM entries WHERE id = ?1", params![id], |r| {
+                Ok((r.get::<_, i64>(0)? != 0, r.get(1)?))
+            })
+            .unwrap()
+    }
+
+    fn tombstones(s: &Store) -> Vec<(String, String)> {
+        s.conn
+            .prepare("SELECT kind, id FROM tombstones ORDER BY kind, id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    fn give_fp(s: &Store, id: i64, fp: &str) {
+        s.conn
+            .execute("UPDATE entries SET fp = ?1, dirty = 0 WHERE id = ?2", params![fp, id])
+            .unwrap();
+    }
+
+    #[test]
+    fn local_changes_mark_rows_for_upload() {
+        let (s, _d) = store();
+        let id = s.record(&Clip::Text("hello".into())).unwrap().unwrap();
+        let (is_dirty, first) = dirty(&s, id);
+        assert!(is_dirty && first > 0);
+
+        give_fp(&s, id, "fp-hello");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        s.record(&Clip::Text("hello".into())).unwrap();
+        let (is_dirty, second) = dirty(&s, id);
+        assert!(is_dirty && second > first, "a re-copy is a change");
+
+        give_fp(&s, id, "fp-hello");
+        s.set_pinned(id, true).unwrap();
+        assert!(dirty(&s, id).0, "pinning is a change");
+        give_fp(&s, id, "fp-hello");
+        s.mark_used(id).unwrap();
+        assert!(dirty(&s, id).0, "using it is a change");
+    }
+
+    #[test]
+    fn deleting_a_synced_entry_leaves_a_tombstone_and_an_unsynced_one_does_not() {
+        let (s, _d) = store();
+        let synced = s.record(&Clip::Text("synced".into())).unwrap().unwrap();
+        let local = s.record(&Clip::Text("local only".into())).unwrap().unwrap();
+        give_fp(&s, synced, "fp-synced");
+        s.delete(synced).unwrap();
+        s.delete(local).unwrap();
+        assert_eq!(tombstones(&s), [("clip".into(), "fp-synced".into())]);
+    }
+
+    #[test]
+    fn clearing_and_trimming_leave_tombstones() {
+        let (mut s, _d) = store();
+        s.set_limits(2, i64::MAX);
+        let ids: Vec<i64> = (0..3)
+            .map(|i| {
+                let id = s.record(&Clip::Text(format!("entry {i}"))).unwrap().unwrap();
+                give_fp(&s, id, &format!("fp-{i}"));
+                // Distinct last_used_at seconds keep the eviction order certain.
+                s.conn
+                    .execute("UPDATE entries SET last_used_at = ?1 WHERE id = ?2", params![i, id])
+                    .unwrap();
+                id
+            })
+            .collect();
+        s.record(&Clip::Text("newest".into())).unwrap();
+        assert!(tombstones(&s).contains(&("clip".into(), "fp-0".into())), "trimmed");
+        assert!(s.content(ids[0]).unwrap().is_none());
+
+        s.clear(true).unwrap();
+        let t = tombstones(&s);
+        assert!(
+            t.contains(&("clip".into(), "fp-1".into()))
+                && t.contains(&("clip".into(), "fp-2".into()))
+        );
+    }
+
+    #[test]
+    fn vault_changes_are_tracked() {
+        let (s, _d) = store();
+        let mut v = crate::vault::Vault::default();
+        v.init(&s, "a long password").unwrap();
+        let id = v.add(&s, "label", "secret").unwrap();
+        let (is_dirty, uid): (bool, Vec<u8>) = s
+            .conn
+            .query_row("SELECT dirty, uid FROM vault_items WHERE id = ?1", params![id], |r| {
+                Ok((r.get::<_, i64>(0)? != 0, r.get(1)?))
+            })
+            .unwrap();
+        assert!(is_dirty);
+        v.delete(&s, id).unwrap();
+        assert_eq!(tombstones(&s), [("vault".into(), crate::crypto::hex(&uid))]);
+    }
+
+    #[test]
+    fn the_account_mirror_round_trips_and_guards_the_key_row() {
+        let (s, _d) = store();
+        assert!(s.account().unwrap().is_none());
+        let dek = crate::crypto::random::<32>();
+        let (keys, _) = AccountKeys::create("a long password", &dek).unwrap();
+        s.set_account(&keys, 123, true).unwrap();
+        assert_eq!(s.account().unwrap().unwrap(), keys);
+        assert_eq!(s.vault_key().unwrap().unwrap(), keys.vault_key_row());
+        assert!(s.set_vault_key(&keys.vault_key_row()).is_err(), "would split the account");
+
+        // A password change through the vault reseals the history key too.
+        let mut v = crate::vault::Vault::default();
+        v.unlock(&s, "a long password").unwrap();
+        v.change_password(&s, "a long password", "another long password").unwrap();
+        let changed = s.account().unwrap().unwrap();
+        assert!(changed.unlock_history("another long password").is_ok());
+        assert!(changed.unlock_history("a long password").is_err());
+        v.lock();
+        v.unlock(&s, "another long password").unwrap();
+    }
+
+    #[test]
+    fn the_device_id_is_made_once() {
+        let (s, _d) = store();
+        let id = s.device_id().unwrap();
+        assert_eq!(id.len(), 32);
+        assert_eq!(s.device_id().unwrap(), id);
+    }
+
+    #[test]
+    fn upgrading_to_v4_marks_existing_history_for_upload() {
+        let dir = tempdir::Dir::new();
+        let path = dir.path().join("v3.db");
+        {
+            let s = Store::open(&path).unwrap();
+            s.record(&Clip::Text("from before sync".into())).unwrap();
+            s.conn
+                .execute_batch(
+                    "UPDATE entries SET dirty = 0, updated_at = 0, last_used_at = 1700000000;
+                     PRAGMA user_version = 3;",
+                )
+                .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let updated: i64 =
+            s.conn.query_row("SELECT updated_at FROM entries", [], |r| r.get(0)).unwrap();
+        assert_eq!(updated, 1_700_000_000_000, "seconds become milliseconds");
+        let v: i64 = s.conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v, 4);
     }
 }
 

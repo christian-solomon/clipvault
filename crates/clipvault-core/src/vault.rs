@@ -206,6 +206,15 @@ impl Vault {
     pub fn change_password(&mut self, store: &Store, current: &str, new: &str) -> Result<()> {
         self.dek()?;
         check_password(new)?;
+        // With sync, the password seals the history key too; both move together.
+        if let Some(account) = store.account()? {
+            let changed = account
+                .change_password(current, new)
+                .map_err(|_| anyhow!("current password is wrong"))?;
+            store.set_account(&changed, crate::store::now_ms(), true)?;
+            self.touch();
+            return Ok(());
+        }
         let key = store.vault_key()?.ok_or_else(|| anyhow!("vault has not been set up yet"))?;
         let dek = unwrap(&key, current)?.ok_or_else(|| anyhow!("current password is wrong"))?;
         store.set_vault_key(&wrap(&dek, new, KdfParams::CURRENT)?)?;
