@@ -104,11 +104,13 @@ impl AccountKeys {
     /// a fresh one), with a fresh history key.
     pub fn create(password: &str, vault_dek: &[u8; 32]) -> Result<(AccountKeys, HistoryKeys)> {
         let history = HistoryKeys::from_root(Zeroizing::new(random::<32>()));
-        let keys = Self::seal_all(password, vault_dek, &history, random::<16>().to_vec())?;
+        let keys = Self::with_history(password, vault_dek, &history, random::<16>().to_vec())?;
         Ok((keys, history))
     }
 
-    fn seal_all(
+    /// Seals a vault key and an existing history key under a password. Used
+    /// when the vault starts over but every device keeps its history key.
+    pub fn with_history(
         password: &str,
         vault_dek: &[u8; 32],
         history: &HistoryKeys,
@@ -170,7 +172,7 @@ impl AccountKeys {
             dek.as_slice().try_into().map_err(|_| anyhow!("the vault key has the wrong length"))?;
         let dek = Zeroizing::new(dek);
         let history = self.unlock_history(old)?;
-        Self::seal_all(new, &dek, &history, self.account_id.clone())
+        Self::with_history(new, &dek, &history, self.account_id.clone())
     }
 
     /// The local vault's key row for this account: same salt, parameters and

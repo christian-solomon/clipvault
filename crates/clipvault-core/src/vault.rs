@@ -101,6 +101,9 @@ impl Vault {
     pub fn status(&self, store: &Store) -> Result<Status> {
         Ok(if self.dek.is_some() {
             Status::Unlocked
+        } else if store.vault_was_reset()? {
+            // Synced and reset: the account stays, the vault starts over.
+            Status::Absent
         } else if Self::exists(store)? {
             Status::Locked
         } else {
@@ -173,6 +176,9 @@ impl Vault {
             }
         }
 
+        if store.vault_was_reset()? {
+            bail!("the vault was reset; create a new one");
+        }
         let dek = if let Some(key) = store.vault_key()? {
             unwrap(&key, password)?
         } else if let Some(legacy) = store.legacy_vault()? {
@@ -309,7 +315,44 @@ impl Vault {
         self.lock();
         self.failures = 0;
         self.retry_at = None;
-        store.reset_vault()
+        // With sync the account stays: it also holds the history key every
+        // device uses. Only the vault's items go, on every device.
+        if store.account()?.is_some() {
+            store.reset_synced_vault()
+        } else {
+            store.reset_vault()
+        }
+    }
+
+    /// Starts the vault over after a reset on a synced device: a new data key
+    /// under a new password, sealed into the account beside the unchanged
+    /// history key, which comes from this device's keyring.
+    pub fn init_synced(
+        &mut self,
+        store: &Store,
+        password: &str,
+        secrets: &dyn crate::account::SecretStore,
+    ) -> Result<()> {
+        if !store.vault_was_reset()? {
+            bail!("the vault was not reset");
+        }
+        check_password(password)?;
+        let account = store.account()?.ok_or_else(|| anyhow!("this device has no sync account"))?;
+        let history = account
+            .saved_history(secrets)?
+            .ok_or_else(|| anyhow!("unlock sync on this device first"))?;
+        let dek = Zeroizing::new(random::<32>());
+        let fresh = crate::account::AccountKeys::with_history(
+            password,
+            &dek,
+            &history,
+            account.account_id.clone(),
+        )?;
+        store.set_account(&fresh, crate::store::now_ms(), true)?;
+        store.clear_vault_reset()?;
+        self.dek = Some(dek);
+        self.touch();
+        Ok(())
     }
 }
 

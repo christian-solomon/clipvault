@@ -32,6 +32,8 @@ pub struct SyncConfig {
     /// `mongodb+srv://…`, with the credentials of a user limited to `database`.
     pub url: String,
     pub database: String,
+    /// Shown on other devices next to clips copied here.
+    pub device_name: String,
     pub db_path: PathBuf,
     pub limits: (usize, i64),
     /// Put clips copied on other devices onto this clipboard.
@@ -169,7 +171,7 @@ async fn session(
     opts.app_name = Some("clipvault".into());
     opts.server_selection_timeout = Some(Duration::from_secs(15));
     opts.connect_timeout = Some(Duration::from_secs(10));
-    let remote = Remote::new(Client::with_options(opts)?.database(&cfg.database));
+    let remote = Remote::new(Client::with_options(opts)?.database(&cfg.database), &cfg.device_name);
     remote.db.run_command(doc! { "ping": 1 }).await?;
     remote.ensure_indexes().await?;
 

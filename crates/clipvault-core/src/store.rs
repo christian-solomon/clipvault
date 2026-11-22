@@ -937,6 +937,28 @@ impl Store {
         self.scrub()
     }
 
+    /// Deletes every vault item, leaving tombstones so other devices follow,
+    /// and marks the vault for a fresh start. The account row stays.
+    pub fn reset_synced_vault(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tombstone_vault_items(&tx, "SELECT id FROM vault_items", &[])?;
+        tx.execute_batch(
+            "DELETE FROM vault_items;
+             INSERT OR REPLACE INTO sync_state (key, value) VALUES ('vault_reset', '1');",
+        )?;
+        tx.commit()?;
+        self.compact()
+    }
+
+    pub fn vault_was_reset(&self) -> Result<bool> {
+        Ok(self.sync_value("vault_reset")?.is_some())
+    }
+
+    pub fn clear_vault_reset(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM sync_state WHERE key = 'vault_reset'", [])?;
+        Ok(())
+    }
+
     pub fn sync_value(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn

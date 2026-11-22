@@ -45,6 +45,7 @@ pub(super) struct Remote {
     vault: Collection<Document>,
     keys: Collection<Document>,
     images: GridFsBucket,
+    device_name: String,
 }
 
 /// Something pulled that this device should act on beyond its database.
@@ -61,8 +62,9 @@ pub(super) enum Pulled {
 }
 
 impl Remote {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db: Database, device_name: &str) -> Self {
         Remote {
+            device_name: device_name.to_string(),
             clips: db.collection(CLIPS),
             vault: db.collection(VAULT),
             keys: db.collection(KEYS),
@@ -191,7 +193,7 @@ impl Remote {
         let mut full = state;
         full.insert("created_at", clip.created_at);
         full.insert("deleted", false);
-        let meta = serde_json::json!({ "kind": clip.kind, "from": device_name() });
+        let meta = serde_json::json!({ "kind": clip.kind, "from": self.device_name });
         full.insert("meta", sealed_doc(&keys.seal_field(fp, "meta", meta.to_string().as_bytes())?));
         match clip.kind.as_str() {
             "image" => {
@@ -529,15 +531,6 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
         return Err(anyhow!("odd-length hex"));
     }
     (0..s.len()).step_by(2).map(|i| Ok(u8::from_str_radix(&s[i..i + 2], 16)?)).collect()
-}
-
-/// The name shown on other devices next to clips copied here.
-pub(super) fn device_name() -> String {
-    std::env::var("CLIPVAULT_DEVICE_NAME")
-        .ok()
-        .filter(|n| !n.trim().is_empty())
-        .or_else(|| std::fs::read_to_string("/etc/hostname").ok().map(|h| h.trim().to_string()))
-        .unwrap_or_else(|| "this computer".into())
 }
 
 fn is_duplicate_key(e: &mongodb::error::Error) -> bool {

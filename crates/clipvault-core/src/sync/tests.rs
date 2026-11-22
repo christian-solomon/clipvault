@@ -110,7 +110,7 @@ fn device() -> Device {
 }
 
 async fn remote(m: &Mongo, db: &str) -> Remote {
-    let r = Remote::new(Client::with_uri_str(&m.url).await.unwrap().database(db));
+    let r = Remote::new(Client::with_uri_str(&m.url).await.unwrap().database(db), "test device");
     r.ensure_indexes().await.unwrap();
     r
 }
@@ -345,6 +345,7 @@ async fn running_engines_wake_each_other_through_the_change_stream() {
     let config = |d: &Device| SyncConfig {
         url: m.url.clone(),
         database: "engines".into(),
+        device_name: "engine".into(),
         db_path: d._dir.path().join("d.db"),
         limits: (500, i64::MAX),
         adopt: true,
@@ -380,4 +381,42 @@ async fn running_engines_wake_each_other_through_the_change_stream() {
     assert!(texts(&b).contains(&"over the change stream".to_string()));
     drop(ha);
     drop(hb);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_forgotten_vault_password_resets_on_every_device_and_history_carries_on() {
+    let Some(m) = mongo().await else { return };
+    let r = remote(&m, "reset").await;
+    let (a, b) = (device(), device());
+    let ka = setup(&r, &a.store, &a.keyring, PW).await.unwrap();
+    let kb = unlock(&r, &b.store, &b.keyring, PW).await.unwrap();
+    let mut va = Vault::default();
+    va.unlock(&a.store, PW).unwrap();
+    va.add(&a.store, "old item", "old secret").unwrap();
+    sync(&r, &a, &ka).await;
+    sync(&r, &b, &kb).await;
+
+    // The password is forgotten on A: reset, then start the vault over.
+    va.reset(&a.store).unwrap();
+    assert_eq!(va.status(&a.store).unwrap(), crate::vault::Status::Absent);
+    assert!(va.unlock(&a.store, PW).is_err(), "the old password opens nothing now");
+    va.init_synced(&a.store, "a fresh password", &a.keyring).unwrap();
+    va.add(&a.store, "new item", "new secret").unwrap();
+    sync(&r, &a, &ka).await;
+    sync(&r, &b, &kb).await;
+
+    // B follows: the old item is gone, the new password opens the new one.
+    let mut vb = Vault::default();
+    assert!(vb.unlock(&b.store, PW).is_err());
+    vb.unlock(&b.store, "a fresh password").unwrap();
+    let items = vb.items(&b.store).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(&*vb.reveal(&b.store, items[0].id).unwrap(), "new secret");
+
+    // History keeps syncing on the keys both devices already hold.
+    a.store.record(&Clip::Text("after the reset".into())).unwrap();
+    sync(&r, &a, &ka).await;
+    sync(&r, &b, &kb).await;
+    assert!(texts(&b).contains(&"after the reset".to_string()));
+    assert!(ready(&r, &b.store, &b.keyring).await.unwrap().is_ok(), "no new unlock needed");
 }

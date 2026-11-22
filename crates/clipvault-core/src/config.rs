@@ -5,6 +5,7 @@
 //! but unparseable is an error rather than a silent fallback.
 
 use anyhow::{anyhow, bail, Result};
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -33,6 +34,44 @@ pub struct Config {
     pub hotkey: Option<String>,
     /// `CLIPVAULT_ALLOW_DEBUGGER=1` keeps the process dumpable and traceable.
     pub allow_debugger: bool,
+    /// Set when `CLIPVAULT_MONGODB_URL` is; without it ClipVault is local-only.
+    pub sync: Option<SyncSettings>,
+}
+
+/// Where and how to sync. The URL carries the database password, so `Debug`
+/// shows only its scheme and host.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SyncSettings {
+    /// `CLIPVAULT_MONGODB_URL`: `mongodb://` or `mongodb+srv://`.
+    pub url: String,
+    /// `CLIPVAULT_MONGODB_DB`, default `clipvault`.
+    pub database: String,
+    /// `CLIPVAULT_DEVICE_NAME`, default the host name. Shown on other devices.
+    pub device_name: String,
+    /// `CLIPVAULT_SYNC_ADOPT=0` stops clips copied elsewhere landing on this
+    /// clipboard; they still appear in history.
+    pub adopt: bool,
+}
+
+impl SyncSettings {
+    /// `scheme://host`, without user, password or options.
+    pub fn redacted_url(&self) -> String {
+        let (scheme, rest) = self.url.split_once("://").unwrap_or(("?", &self.url));
+        let host = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+        let host = host.split(['/', '?']).next().unwrap_or("");
+        format!("{scheme}://{host}")
+    }
+}
+
+impl fmt::Debug for SyncSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SyncSettings")
+            .field("url", &self.redacted_url())
+            .field("database", &self.database)
+            .field("device_name", &self.device_name)
+            .field("adopt", &self.adopt)
+            .finish()
+    }
 }
 
 impl Config {
@@ -84,12 +123,39 @@ impl Config {
             )?),
             hotkey,
             allow_debugger: set("CLIPVAULT_ALLOW_DEBUGGER").as_deref() == Some("1"),
+            sync: sync_settings(&set)?,
         })
     }
 
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join(DB_FILE)
     }
+}
+
+fn sync_settings(set: &impl Fn(&str) -> Option<String>) -> Result<Option<SyncSettings>> {
+    let Some(url) = set("CLIPVAULT_MONGODB_URL").map(|u| u.trim().to_string()) else {
+        return Ok(None);
+    };
+    if !(url.starts_with("mongodb://") || url.starts_with("mongodb+srv://")) {
+        bail!("CLIPVAULT_MONGODB_URL must start with mongodb:// or mongodb+srv://");
+    }
+    let adopt = match set("CLIPVAULT_SYNC_ADOPT").map(|v| v.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(v) if ["1", "true", "yes", "on"].contains(&v.as_str()) => true,
+        Some(v) if ["0", "false", "no", "off"].contains(&v.as_str()) => false,
+        Some(v) => bail!("CLIPVAULT_SYNC_ADOPT={v:?} is not 0 or 1"),
+    };
+    let device_name = set("CLIPVAULT_DEVICE_NAME")
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "this computer".into());
+    Ok(Some(SyncSettings {
+        url,
+        database: set("CLIPVAULT_MONGODB_DB").unwrap_or_else(|| "clipvault".into()),
+        device_name,
+        adopt,
+    }))
 }
 
 fn parse<T: std::str::FromStr>(
@@ -130,6 +196,39 @@ mod tests {
         assert_eq!(c.clipboard_clear, Duration::from_secs(30));
         assert_eq!(c.hotkey.as_deref(), Some("super+v"));
         assert!(!c.allow_debugger);
+        assert!(c.sync.is_none(), "local-only unless a URL is given");
+    }
+
+    #[test]
+    fn sync_settings_come_from_the_environment_and_hide_the_password() {
+        let c = cfg(&[
+            ("HOME", "/home/u"),
+            (
+                "CLIPVAULT_MONGODB_URL",
+                "mongodb+srv://app:hunter2@cv.abc.mongodb.net/?retryWrites=true",
+            ),
+            ("CLIPVAULT_DEVICE_NAME", "laptop"),
+            ("CLIPVAULT_SYNC_ADOPT", "0"),
+        ])
+        .unwrap();
+        let sync = c.sync.unwrap();
+        assert_eq!(sync.database, "clipvault");
+        assert_eq!(sync.device_name, "laptop");
+        assert!(!sync.adopt);
+        assert_eq!(sync.redacted_url(), "mongodb+srv://cv.abc.mongodb.net");
+        let shown = format!("{sync:?}");
+        assert!(!shown.contains("hunter2") && !shown.contains("app:"), "{shown}");
+    }
+
+    #[test]
+    fn a_bad_sync_url_or_flag_is_an_error() {
+        assert!(cfg(&[("HOME", "/h"), ("CLIPVAULT_MONGODB_URL", "https://x")]).is_err());
+        assert!(cfg(&[
+            ("HOME", "/h"),
+            ("CLIPVAULT_MONGODB_URL", "mongodb://x"),
+            ("CLIPVAULT_SYNC_ADOPT", "maybe")
+        ])
+        .is_err());
     }
 
     #[test]
