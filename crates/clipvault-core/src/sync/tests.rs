@@ -1,6 +1,10 @@
 //! The engine against a throwaway single-node replica set of the local
 //! `mongod`, two simulated devices sharing one database. Skipped when there
 //! is no `mongod` on PATH.
+//!
+//! With `CLIPVAULT_TEST_MONGODB_URL` set they run against that cluster
+//! instead. Each test then uses databases named `cvt_<random>_…`, dropped
+//! when it ends.
 
 use std::collections::HashMap;
 use std::process::{Child, Command as Proc, Stdio};
@@ -17,19 +21,53 @@ use crate::vault::Vault;
 const PW: &str = "correct horse battery";
 
 struct Mongo {
-    child: Child,
+    /// The local `mongod`; `None` for a cluster named by URL.
+    child: Option<Child>,
     url: String,
-    _dir: Dir,
+    prefix: String,
+    _dir: Option<Dir>,
+}
+
+impl Mongo {
+    fn db(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
 }
 
 impl Drop for Mongo {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        // The test's runtime may be the one dropping this; use another.
+        let (url, prefix) = (self.url.clone(), self.prefix.clone());
+        let dropped = std::thread::spawn(move || {
+            let prefix = prefix.as_str();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+            rt.block_on(async {
+                let client = Client::with_uri_str(&url).await?;
+                for name in client.list_database_names().await? {
+                    if name.starts_with(prefix) {
+                        client.database(&name).drop().await?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+        })
+        .join();
+        if !matches!(dropped, Ok(Ok(()))) {
+            eprintln!("could not drop the {}* test databases", self.prefix);
+        }
     }
 }
 
 async fn mongo() -> Option<Mongo> {
+    if let Ok(url) = std::env::var("CLIPVAULT_TEST_MONGODB_URL") {
+        let prefix = format!("cvt_{}_", crate::crypto::hex(&random::<3>()));
+        return Some(Mongo { child: None, url, prefix, _dir: None });
+    }
     if Proc::new("mongod").arg("--version").stdout(Stdio::null()).status().is_err() {
         eprintln!("skipping: no mongod on PATH");
         return None;
@@ -47,9 +85,10 @@ async fn mongo() -> Option<Mongo> {
         .unwrap();
     // The guard stops mongod however this function or the test ends.
     let guard = Mongo {
-        child,
+        child: Some(child),
         url: format!("mongodb://127.0.0.1:{port}/?directConnection=true"),
-        _dir: dir,
+        prefix: String::new(),
+        _dir: Some(dir),
     };
     let client = Client::with_uri_str(&guard.url).await.unwrap();
     let admin = client.database("admin");
@@ -110,7 +149,7 @@ fn device() -> Device {
 }
 
 async fn remote(m: &Mongo, db: &str) -> Remote {
-    let r = Remote::new(Client::with_uri_str(&m.url).await.unwrap().database(db), "test device");
+    let r = Remote::new(Client::with_uri_str(&m.url).await.unwrap().database(&m.db(db)), "test device");
     r.ensure_indexes().await.unwrap();
     r
 }
@@ -344,7 +383,7 @@ async fn running_engines_wake_each_other_through_the_change_stream() {
     let (a, b) = (device(), device());
     let config = |d: &Device| SyncConfig {
         url: m.url.clone(),
-        database: "engines".into(),
+        database: m.db("engines"),
         device_name: "engine".into(),
         db_path: d._dir.path().join("d.db"),
         limits: (500, i64::MAX),
