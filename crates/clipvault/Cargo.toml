@@ -46,6 +46,7 @@ entering any clipboard history and are cleared after a delay."""
 depends = "libxcb1, libxkbcommon0, libxkbcommon-x11-0, libvulkan1 | libegl1"
 assets = [
     ["target/release/clipvault", "usr/bin/", "755"],
+    ["../../assets/clipvault-infisical", "usr/bin/", "755"],
     ["../../assets/clipvault.desktop", "usr/share/applications/", "644"],
     ["../../assets/icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/clipvault.png", "644"],
     ["../../assets/icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/clipvault.png", "644"],

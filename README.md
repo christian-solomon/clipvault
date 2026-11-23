@@ -113,7 +113,7 @@ an invalid one stops startup with an error naming it.
 | `CLIPVAULT_HISTORY_MAX_BYTES` | `268435456` | byte budget for unpinned entries |
 | `CLIPVAULT_ALLOW_DEBUGGER` | unset | `1` keeps the process dumpable |
 | `CLIPVAULT_MONGODB_URL` | unset | sync database; without it ClipVault is local-only |
-| `CLIPVAULT_MONGODB_DB` | `clipvault` | database name within it |
+| `CLIPVAULT_MONGODB_DB` | the URL's database, else `clipvault` | database name within it |
 | `CLIPVAULT_DEVICE_NAME` | host name | shown on other devices next to clips copied here |
 | `CLIPVAULT_SYNC_ADOPT` | `1` | `0` stops other devices' copies landing on this clipboard |
 | `RUST_LOG` | `warn,clipvault=info,clipvault_core=info` | log filter; logs go to stdout |
@@ -143,14 +143,19 @@ mobile clients.
 
 Setting up:
 
-1. Create a MongoDB database user limited to `readWrite` on the sync
-   database. Keep its connection string out of files; the launcher below
-   reads it from Infisical.
-2. Start ClipVault with the URL in its environment, for example:
+1. Store the connection string, with the database in its path
+   (`…mongodb.net/clipvault?…`), as `CLIPVAULT_MONGODB_URL` in an Infisical
+   project. Its user needs `readWrite` on that database and nothing more.
+2. Start ClipVault through `clipvault-infisical`, which reads the URL from
+   Infisical into ClipVault's environment and starts local-only when it
+   can't (signed out, or offline with nothing cached). For the login
+   autostart entry:
 
-   ```bash
-   infisical run --projectId <id> --env prod -- clipvault --no-hotkey
+   ```ini
+   Exec=env CLIPVAULT_INFISICAL_PROJECT=<project id> clipvault-infisical --no-hotkey
    ```
+
+   `CLIPVAULT_INFISICAL_ENV` picks the environment (default `prod`).
 
 3. The header chip says **Set up sync** on the first device. Choose the
    master password there, or use the vault's password if this device

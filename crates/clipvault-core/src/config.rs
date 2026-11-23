@@ -44,7 +44,8 @@ pub struct Config {
 pub struct SyncSettings {
     /// `CLIPVAULT_MONGODB_URL`: `mongodb://` or `mongodb+srv://`.
     pub url: String,
-    /// `CLIPVAULT_MONGODB_DB`, default `clipvault`.
+    /// `CLIPVAULT_MONGODB_DB`, else the database named in the URL, else
+    /// `clipvault`.
     pub database: String,
     /// `CLIPVAULT_DEVICE_NAME`, default the host name. Shown on other devices.
     pub device_name: String,
@@ -132,6 +133,15 @@ impl Config {
     }
 }
 
+/// The database in a connection string's path: `…@host/<db>?options`.
+fn url_database(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let rest = rest.split('?').next()?;
+    let hosts_and_path = rest.rsplit_once('@').map_or(rest, |(_, h)| h);
+    let db = hosts_and_path.split_once('/')?.1;
+    (!db.is_empty()).then(|| db.to_string())
+}
+
 fn sync_settings(set: &impl Fn(&str) -> Option<String>) -> Result<Option<SyncSettings>> {
     let Some(url) = set("CLIPVAULT_MONGODB_URL").map(|u| u.trim().to_string()) else {
         return Ok(None);
@@ -150,9 +160,12 @@ fn sync_settings(set: &impl Fn(&str) -> Option<String>) -> Result<Option<SyncSet
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| "this computer".into());
+    let database = set("CLIPVAULT_MONGODB_DB")
+        .or_else(|| url_database(&url))
+        .unwrap_or_else(|| "clipvault".into());
     Ok(Some(SyncSettings {
         url,
-        database: set("CLIPVAULT_MONGODB_DB").unwrap_or_else(|| "clipvault".into()),
+        database,
         device_name,
         adopt,
     }))
@@ -218,6 +231,23 @@ mod tests {
         assert_eq!(sync.redacted_url(), "mongodb+srv://cv.abc.mongodb.net");
         let shown = format!("{sync:?}");
         assert!(!shown.contains("hunter2") && !shown.contains("app:"), "{shown}");
+    }
+
+    #[test]
+    fn the_database_comes_from_the_variable_then_the_url() {
+        let db = |vars: &[(&str, &str)]| {
+            let mut all = vec![("HOME", "/h")];
+            all.extend_from_slice(vars);
+            cfg(&all).unwrap().sync.unwrap().database
+        };
+        let url = "mongodb+srv://app:p%2Fw@cv.abc.mongodb.net/fromurl?retryWrites=true";
+        assert_eq!(db(&[("CLIPVAULT_MONGODB_URL", url)]), "fromurl");
+        assert_eq!(
+            db(&[("CLIPVAULT_MONGODB_URL", url), ("CLIPVAULT_MONGODB_DB", "override")]),
+            "override"
+        );
+        assert_eq!(db(&[("CLIPVAULT_MONGODB_URL", "mongodb://h1,h2/?w=1")]), "clipvault");
+        assert_eq!(db(&[("CLIPVAULT_MONGODB_URL", "mongodb://u:p@h:27017")]), "clipvault");
     }
 
     #[test]

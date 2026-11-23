@@ -75,6 +75,10 @@ ENVIRONMENT:
     CLIPVAULT_HISTORY_MAX_ENTRIES      unpinned entries kept (500)
     CLIPVAULT_HISTORY_MAX_BYTES        byte budget for unpinned entries (268435456)
     CLIPVAULT_ALLOW_DEBUGGER=1         keep the process dumpable, for debugging
+    CLIPVAULT_MONGODB_URL              sync database; unset means local-only
+    CLIPVAULT_MONGODB_DB               database name (the URL's, else clipvault)
+    CLIPVAULT_DEVICE_NAME              shown on other devices (default host name)
+    CLIPVAULT_SYNC_ADOPT=0             keep other devices' copies off this clipboard
     RUST_LOG                           log filter, logs go to stdout
                                        (default warn,clipvault=info,clipvault_core=info)
 

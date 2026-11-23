@@ -29,7 +29,8 @@ use crate::vault;
 use remote::{Pulled, Remote};
 
 pub struct SyncConfig {
-    /// `mongodb+srv://…`, with the credentials of a user limited to `database`.
+    /// `mongodb://` or `mongodb+srv://`, with credentials that can read and
+    /// write `database`.
     pub url: String,
     pub database: String,
     /// Shown on other devices next to clips copied here.
