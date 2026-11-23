@@ -1,0 +1,25 @@
+#!/bin/sh
+# Starts ClipVault with CLIPVAULT_MONGODB_URL read from Infisical, so the
+# connection string is never written to a file. Without a value from
+# Infisical (signed out, offline with nothing cached, no project given)
+# ClipVault starts local-only.
+#
+#   CLIPVAULT_INFISICAL_PROJECT  Infisical project ID; required for sync
+#   CLIPVAULT_INFISICAL_ENV      environment slug, default prod
+#
+# Arguments are passed on to clipvault.
+set -u
+
+if [ -z "${CLIPVAULT_MONGODB_URL:-}" ] && [ -n "${CLIPVAULT_INFISICAL_PROJECT:-}" ]; then
+    url=$(timeout 30 infisical secrets-manager secrets get CLIPVAULT_MONGODB_URL \
+        --projectId "$CLIPVAULT_INFISICAL_PROJECT" --env "${CLIPVAULT_INFISICAL_ENV:-prod}" \
+        --plain --expand=false --silent 2>/dev/null) || url=
+    if [ -n "$url" ]; then
+        CLIPVAULT_MONGODB_URL=$url
+        export CLIPVAULT_MONGODB_URL
+    else
+        echo "clipvault-infisical: no sync URL from Infisical; starting local-only"
+    fi
+fi
+
+exec clipvault "$@"

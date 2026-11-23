@@ -1,0 +1,57 @@
+[package]
+name = "clipvault"
+description = "Clipboard history with an encrypted secrets vault, for X11 on Linux"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+clipvault-core = { path = "../clipvault-core" }
+
+# GPUI moves weekly; gpui-component pins an exact snapshot and everything
+# GPUI-related here must match it.
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-pre-platform = { version = "=0.3.12", default-features = false, features = ["x11"] }
+gpui-component = "=0.10.0"
+gpui-kit-assets = "=0.10.0"
+
+async-channel = "2"
+ksni = { version = "0.3.7", default-features = false, features = ["blocking", "async-io"] }
+global-hotkey = "0.10.0"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+x11rb = "0.13"
+raw-window-handle = "0.6"
+
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+zeroize = "1"
+
+[dev-dependencies]
+serde_json = "1"
+
+# `cargo install cargo-deb && cargo deb -p clipvault`
+# Keeps the package name the Tauri build used, so it upgrades in place.
+[package.metadata.deb]
+name = "clip-vault"
+maintainer = "Christian Solomon"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Clipboard history for X11 with an encrypted secrets vault. Copies that look \
+like credentials are kept in memory only; vault secrets are copied without \
+entering any clipboard history and are cleared after a delay."""
+# Linked: xcb, xkbcommon. Loaded at runtime: Vulkan, or EGL as the fallback.
+depends = "libxcb1, libxkbcommon0, libxkbcommon-x11-0, libvulkan1 | libegl1"
+assets = [
+    ["target/release/clipvault", "usr/bin/", "755"],
+    ["../../assets/clipvault-infisical", "usr/bin/", "755"],
+    ["../../assets/clipvault.desktop", "usr/share/applications/", "644"],
+    ["../../assets/icons/32x32.png", "usr/share/icons/hicolor/32x32/apps/clipvault.png", "644"],
+    ["../../assets/icons/128x128.png", "usr/share/icons/hicolor/128x128/apps/clipvault.png", "644"],
+    ["../../assets/icons/128x128@2x.png", "usr/share/icons/hicolor/256x256/apps/clipvault.png", "644"],
+    ["../../assets/icons/icon.png", "usr/share/icons/hicolor/512x512/apps/clipvault.png", "644"],
+    ["../../assets/fonts/inter/OFL.txt", "usr/share/doc/clip-vault/fonts/Inter-OFL.txt", "644"],
+    ["../../assets/fonts/geist/OFL.txt", "usr/share/doc/clip-vault/fonts/Geist-OFL.txt", "644"],
+]
